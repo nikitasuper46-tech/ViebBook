@@ -1,0 +1,277 @@
+\chapter{Оптимизация образов}
+
+Маленький образ быстрее скачивается, быстрее запускается, занимает
+меньше места в реестре и оставляет меньше поверхности атаки. При этом
+оптимизация не должна превращаться в самоцель: важнее
+воспроизводимость и понятность. В главе~--- что именно занимает место,
+как выбрать базу и как измерить результат.
+
+\section{Почему размер важен}
+
+\begin{itemize}
+  \item \textbf{Скорость доставки.} Образ в 1~ГБ скачивается
+        в десять раз дольше, чем в 100~МБ.
+  \item \textbf{Холодный старт.} На новом узле контейнер не запустится,
+        пока не распакуются слои.
+  \item \textbf{Стоимость хранения.} Реестры и диски узлов не бесплатны.
+  \item \textbf{Поверхность атаки.} Каждый лишний пакет~--- потенциальная
+        уязвимость.
+  \item \textbf{Скорость CI.} Меньше данных~--- быстрее \cmd{push}
+        и \cmd{pull} в конвейере.
+\end{itemize}
+
+\begin{notebox}
+Размер не единственная метрика. Образ на 300~МБ с понятным
+Dockerfile лучше образа на 150~МБ, собранного хрупким скриптом.
+Сначала правильность и воспроизводимость, потом байты.
+\end{notebox}
+
+\section{Что занимает место}
+
+Посмотрите на слои и их размеры.
+
+\begin{code}[language=bash]
+$ docker image ls
+$ docker history --human --no-trunc api:1.0
+$ docker system df -v
+\end{code}
+
+Типичные источники лишнего веса:
+
+\begin{itemize}
+  \item полный базовый образ с компиляторами и документацией;
+  \item кэши пакетных менеджеров (\cmd{\textasciitilde/.cache/pip},
+        \cmd{/root/.npm}, \cmd{/var/lib/apt/lists});
+  \item инструменты сборки, оставшиеся в финальном слое;
+  \item исходники и тесты, скопированные \cmd{COPY . .};
+  \item отладочные символы в бинарниках;
+  \item несколько пакетных менеджеров в одном образе.
+\end{itemize}
+
+Для визуального анализа удобен \cmd{dive}: он показывает слои,
+их размер и \enquote{мусор} внутри.
+
+\begin{code}[language=bash]
+$ dive api:1.0
+\end{code}
+
+\section{Выбор базового образа}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+\textbf{База} & \textbf{Размер} & \textbf{Особенности} \\
+\midrule
+\cmd{scratch} & 0 & пустой; только статические бинарники, нет
+оболочки и \file{/etc/passwd} \\
+\cmd{distroless} & 2--20 МБ & минимальные библиотеки, нет shell;
+удобно для Go, Java, Python с осторожностью \\
+\cmd{alpine} & 5--10 МБ & musl libc, \cmd{apk}; экономия, но возможны
+сюрпризы с бинарными wheel'ами \\
+\cmd{-slim} & 50--90 МБ & Debian без лишнего; привычный glibc
+и \cmd{apt} \\
+полный образ & 150--900 МБ & компиляторы, заголовки, утилиты; годится
+как builder, но не как runtime \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{warnbox}
+Alpine экономит десятки мегабайт, но использует musl вместо glibc.
+Некоторые Python-пакеты и JVM-библиотеки требуют сборки или ведут
+себя иначе, а DNS и locale отличаются от Debian. Проверяйте
+приложение на выбранной базе, а не только на \cmd{ubuntu}.
+\end{warnbox}
+
+\section{Порядок слоёв и очистка}
+
+\begin{code}[language=dockerfile]
+# Плохо: кэш apt остаётся в слое
+RUN apt-get update
+RUN apt-get install -y curl
+RUN rm -rf /var/lib/apt/lists/*
+
+# Хорошо: всё в одном слое
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+\end{code}
+
+Удаление файла в следующем слое не уменьшает образ: файл остаётся
+в нижнем слое, а сверху появляется whiteout. Чистить нужно в том же
+\cmd{RUN}, где создан мусор.
+
+Для Python и Node.js:
+
+\begin{code}[language=dockerfile]
+RUN pip install --no-cache-dir -r requirements.txt
+RUN npm ci --omit=dev && npm cache clean --force
+\end{code}
+
+\section{Кэш сборки}
+
+Кэш не влияет на размер финального образа, но сильно влияет на время
+сборки.
+
+\begin{code}[language=dockerfile]
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+COPY . .
+\end{code}
+
+Кэш-монтирование сохраняет скачанные пакеты между сборками, не попадая
+в образ. Для Node.js аналогично используется \cmd{/root/.npm}.
+
+\begin{tipbox}
+В CI включайте \flag{--cache-from type=registry} или
+\flag{--cache-to type=gha}. Это даёт ускорение в разы по сравнению
+с чистой сборкой на каждом коммите.
+\end{tipbox}
+
+\section{Многоэтапная сборка как основной приём}
+
+Идея проста: тяжёлые инструменты нужны только для сборки, а в runtime
+попадает результат.
+
+\begin{code}[language=dockerfile]
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM node:22-alpine
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --chown=node:node . .
+USER node
+ENV NODE_ENV=production
+CMD ["node", "server.js"]
+\end{code}
+
+Для Go финальный слой может быть \cmd{scratch}:
+
+\begin{code}[language=dockerfile]
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /app ./cmd/app
+
+FROM scratch
+COPY --from=build /app /app
+USER 10001
+ENTRYPOINT ["/app"]
+\end{code}
+
+Флаг \flag{-ldflags="-s -w"} убирает отладочные символы,
+\flag{-trimpath}~--- абсолютные пути сборки. Вместе они дают
+заметную экономию и немного улучшают воспроизводимость.
+
+\section{Пример: от 1 ГБ к 150 МБ}
+
+\begin{code}[language=dockerfile]
+# Было
+FROM python:3.13
+COPY . .
+RUN pip install -r requirements.txt
+CMD ["python", "app.py"]
+\end{code}
+
+Проблемы: полный образ с компиляторами, весь контекст (включая тесты
+и \file{.git}) в образе, кэш pip, запуск от root, нет закреплённых
+зависимостей.
+
+\begin{code}[language=dockerfile]
+# Стало
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY --chown=10001:10001 app.py .
+USER 10001
+CMD ["python", "app.py"]
+\end{code}
+
+Плюс \file{.dockerignore}:
+
+\begin{code}
+.git
+tests
+__pycache__
+*.pyc
+.env
+.venv
+\end{code}
+
+Результат: образ уменьшается примерно с 1~ГБ до 150~МБ, а слой
+с зависимостями переиспользуется при изменении \file{app.py}.
+
+\begin{code}[language=bash]
+$ docker image ls api
+REPOSITORY   TAG      IMAGE ID       SIZE
+api          before   a11111111111   1.02GB
+api          after    b22222222222   152MB
+\end{code}
+
+\section{Ускорение сборки}
+
+\begin{itemize}
+  \item Используйте BuildKit (по умолчанию в современных версиях).
+  \item Кэшируйте пакетные менеджеры через
+        \flag{--mount=type=cache}.
+  \item Копируйте манифесты зависимостей раньше кода.
+  \item Исключайте лишнее через \file{.dockerignore}.
+  \item Разделяйте этапы: сборка зависимостей, сборка приложения,
+        упаковка.
+  \item В CI используйте удалённый кэш и параллельные этапы.
+\end{itemize}
+
+\begin{code}[language=bash]
+$ docker buildx build --progress=plain -t api:1.0 .
+$ time docker build -q -t api:1.0 .
+\end{code}
+
+\section{Что не стоит делать}
+
+\begin{itemize}
+  \item \textbf{Не используйте \flag{--squash} как основной приём.}
+        Он ломает переиспользование слоёв и усложняет кэш.
+  \item \textbf{Не удаляйте файлы в отдельных слоях} в надежде уменьшить
+        образ.
+  \item \textbf{Не гонитесь за минимальным размером ценой ремонтопригодности.}
+        Distroless без shell усложняет отладку.
+  \item \textbf{Не устанавливайте пакеты без фиксации версий}~---
+        сборка перестанет быть воспроизводимой.
+  \item \textbf{Не храните в образе секреты}~--- их не убрать удалением
+        файла.
+\end{itemize}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Место занимают базовый образ, кэши, инструменты сборки
+        и лишние файлы.
+  \item Минимальная база и многоэтапная сборка дают наибольший эффект.
+  \item Чистка должна происходить в том же слое, где создан мусор.
+  \item Кэш-монтирования и удалённый кэш ускоряют сборку, не увеличивая
+        образ.
+  \item Измеряйте результат \cmd{docker history}, \cmd{dive}
+        и \cmd{docker image ls}.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Почему \cmd{rm} в отдельном слое не уменьшает образ?
+  \item Чем distroless отличается от alpine и когда он уместен?
+  \item Какие флаги Go уменьшают размер бинарника?
+  \item Зачем нужен \flag{--mount=type=cache}?
+  \item Почему \file{.dockerignore} влияет и на размер, и на безопасность?
+  \item Что измерять, чтобы понять, какой слой самый тяжёлый?
+\end{selfcheck}

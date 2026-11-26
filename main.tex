@@ -1,0 +1,35 @@
+\documentclass[11pt,a4paper,oneside]{book}
+\input{preamble}
+
+\begin{document}
+
+\input{titlepage}
+
+\frontmatter
+\tableofcontents
+\input{chapters/00-preface}
+
+\mainmatter
+
+\part{Введение в контейнеры}
+\input{chapters/01-why}
+\input{chapters/02-how}
+\input{chapters/03-install}
+
+\part{Образы, контейнеры и данные}
+\input{chapters/04-images}
+\input{chapters/05-containers}
+\input{chapters/06-dockerfile}
+\input{chapters/07-data}
+
+\part{Сети и оркестрация}
+\input{chapters/08-networks}
+\input{chapters/09-compose}
+
+\part{Эксплуатация}
+\input{chapters/10-registry}
+\input{chapters/11-debug}
+\input{chapters/12-security}
+\input{chapters/13-optimize}
+
+\end{document}

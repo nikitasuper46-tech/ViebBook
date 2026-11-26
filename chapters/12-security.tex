@@ -1,0 +1,314 @@
+\chapter{Безопасность}
+
+Контейнеры дают изоляцию, но не являются границей безопасности уровня
+виртуальной машины. Ошибка в Dockerfile, лишняя привилегия или пароль
+в слое образа сводят защиту на нет. В главе~--- практические меры,
+которые закрывают большинство рисков без усложнения эксплуатации.
+
+\section{Модель угроз}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}XX@{}}
+\toprule
+\textbf{Риск} & \textbf{Мера} \\
+\midrule
+уязвимости в базовом образе и зависимостях & минимальный образ,
+регулярная пересборка, сканирование \\
+лишние привилегии процесса & \cmd{USER}, \cmd{--cap-drop},
+\cmd{no-new-privileges} \\
+секреты в образе или истории сборки & \file{.dockerignore},
+\flag{--secret}, менеджер секретов \\
+доступ к сокету Docker & не монтировать в контейнеры, использовать
+proxy или rootless \\
+заражённый образ из реестра & официальные источники, digest, подписи,
+SBOM \\
+атака через общее ядро & актуальное ядро, rootless, gVisor/Kata
+для недоверенного кода \\
+исчерпание ресурсов & лимиты памяти, CPU, числа процессов \\
+открытые наружу порты & публикация только нужного, \cmd{127.0.0.1},
+внутренние сети \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{defbox}
+\textbf{Принцип минимальных привилегий}: контейнер получает только
+те права, файлы и сетевые доступы, которые нужны приложению для
+работы. Всё остальное отключено по умолчанию.
+\end{defbox}
+
+\section{Запуск без root}
+
+По умолчанию процесс в контейнере работает от \cmd{root}. Если
+приложение скомпрометировано, атакующий получает root внутри
+контейнера~--- и, при ошибке в конфигурации, путь к хосту.
+
+\begin{code}[language=dockerfile]
+FROM python:3.13-slim
+
+RUN groupadd --gid 10001 app \
+ && useradd --uid 10001 --gid app --create-home app
+
+WORKDIR /app
+COPY --chown=app:app . .
+RUN pip install --no-cache-dir -r requirements.txt
+
+USER 10001:10001
+CMD ["python", "app.py"]
+\end{code}
+
+\begin{itemize}
+  \item \cmd{USER} в Dockerfile задаёт пользователя по умолчанию.
+  \item \cmd{--user 10001:10001} в \cmd{docker run} переопределяет его.
+  \item В Kubernetes удобнее числовые UID: они не зависят от
+        \file{/etc/passwd} образа.
+\end{itemize}
+
+\begin{code}[language=bash]
+$ docker run -d --name api \
+    --user 10001:10001 \
+    --read-only \
+    --tmpfs /tmp:size=32m \
+    --cap-drop=ALL \
+    --security-opt=no-new-privileges:true \
+    --pids-limit=200 \
+    --memory=512m --cpus=1 \
+    api:1.0
+\end{code}
+
+\begin{itemize}
+  \item \flag{--read-only} делает корневую файловую систему только для
+        чтения; запись возможна в тома и \cmd{tmpfs}.
+  \item \flag{--cap-drop=ALL} убирает все Linux capabilities; при
+        необходимости добавьте одну: \flag{--cap-add=NET\_BIND\_SERVICE}.
+  \item \flag{--security-opt=no-new-privileges:true} запрещает
+        программы с setuid повышать права.
+  \item \flag{--pids-limit} защищает от fork-бомб.
+\end{itemize}
+
+\begin{warnbox}
+\flag{--privileged} отключает большинство ограничений: контейнер
+получает доступ к устройствам, все capabilities и зачастую может
+влиять на хост. Не используйте его, если точно не понимаете,
+зачем он нужен.
+\end{warnbox}
+
+\section{User namespaces и rootless}
+
+В обычном режиме \cmd{root} внутри контейнера~--- это тот же UID~0,
+что и на хосте, но с ограниченными возможностями. User namespaces
+отображают внутренние UID на непривилегированные внешние.
+
+\begin{code}[language=bash]
+{
+  "userns-remap": "default"
+}
+\end{code}
+
+Это фрагмент \file{/etc/docker/daemon.json}; после перезапуска демон
+переотобразит UID и GID. Побочный эффект: существующие тома и образы
+могут стать недоступны, а права на привязанные каталоги придётся
+согласовывать.
+
+Rootless-режим (раздел~3.4.2) идёт дальше: весь демон работает
+от обычного пользователя. Для рабочих станций и CI это хороший
+компромисс между удобством и безопасностью.
+
+\begin{notebox}
+Rootless и user namespaces не отменяют уязвимости ядра, но снижают
+последствия: процесс с UID~0 внутри контейнера не является root
+на хосте.
+\end{notebox}
+
+\section{Секреты}
+
+Секреты нельзя хранить в образе: слои сохраняются, \cmd{docker history}
+и сканеры их видят. Основные правила:
+
+\begin{itemize}
+  \item не передавайте секреты через \cmd{ARG}~--- они попадают
+        в историю и кэш;
+  \item не копируйте \file{.env} и ключи в образ~--- исключайте
+        их в \file{.dockerignore};
+  \item передавайте секреты при запуске через переменные окружения,
+        файлы, смонтированные только для чтения, или менеджер
+        секретов;
+  \item не логируйте значения секретов, маскируйте их в приложении.
+\end{itemize}
+
+Compose поддерживает секреты-файлы:
+
+\begin{code}[language=composeyaml]
+services:
+  api:
+    image: api:1.0
+    secrets:
+      - db_password
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+\end{code}
+
+Внутри контейнера секрет появится как файл
+\file{/run/secrets/db\_password} с правами только для чтения.
+В Swarm тот же синтаксис использует зашифрованное хранилище менеджера.
+
+\begin{warnbox}
+Переменные окружения видны процессам контейнера и могут попасть
+в логи, дампы и диагностические отчёты. Для паролей и ключей
+предпочтительнее файлы или специализированные хранилища (Vault,
+облачные secret manager'ы), а не \cmd{ENV}.
+\end{warnbox}
+
+\section{Безопасность образов}
+
+\subsection{Минимальная база}
+
+Чем меньше в образе пакетов и утилит, тем меньше поверхность атаки.
+Порядок предпочтений: \cmd{scratch} или distroless~$\rightarrow$
+\cmd{alpine}/slim~$\rightarrow$ полный дистрибутив.
+
+\begin{code}[language=dockerfile]
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/app /app
+ENTRYPOINT ["/app"]
+\end{code}
+
+\subsection{Сканирование}
+
+\begin{code}[language=bash]
+$ docker scout cves api:1.0
+$ trivy image --severity HIGH,CRITICAL api:1.0
+$ docker history --no-trunc api:1.0
+$ docker buildx build --sbom=true --provenance=true --push -t api:1.0 .
+\end{code}
+
+Сканируйте не только финальный образ, но и базовый: уязвимость
+в \cmd{python:3.13-slim} перейдёт во все производные образы.
+
+\subsection{Проверка происхождения}
+
+\begin{code}[language=bash]
+$ cosign verify --certificate-identity-regexp '.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    ghcr.io/acme/api:1.0
+\end{code}
+
+Подпись и проверка подписи позволяют разрешать к запуску только
+образы, собранные доверенным конвейером. Политики внедряются
+в Kubernetes (Kyverno, OPA Gatekeeper) или в admission-контроллеры
+реестра.
+
+\section{Сокет Docker}
+
+Монтирование \file{/var/run/docker.sock} в контейнер даёт ему
+возможность управлять демоном, а значит~--- запускать привилегированные
+контейнеры и монтировать каталоги хоста. Это фактически root.
+
+\begin{code}[language=bash]
+# Опасно: контейнер получает управление Docker на хосте
+$ docker run -v /var/run/docker.sock:/var/run/docker.sock my-ci-image
+\end{code}
+
+Безопасные альтернативы:
+
+\begin{itemize}
+  \item \textbf{proxy}~--- \cmd{docker-socket-proxy} разрешает только
+        нужные методы API;
+  \item \textbf{отдельный демон} в rootless-режиме или в виртуальной
+        машине для CI;
+  \item \textbf{SSH-контекст} вместо проброса сокета;
+  \item \textbf{BuildKit-демон} с ограниченным набором операций.
+\end{itemize}
+
+\section{Сеть}
+
+\begin{itemize}
+  \item Публикуйте только необходимые порты и по возможности
+        на \cmd{127.0.0.1}.
+  \item Не используйте \flag{--network host} без необходимости.
+  \item Для внутренних сервисов создавайте сеть с флагом
+        \flag{--internal}: у неё нет выхода наружу.
+  \item Не смешивайте в одной сети сервисы разных уровней доверия.
+\end{itemize}
+
+\begin{code}[language=bash]
+$ docker network create --internal backend
+\end{code}
+
+\begin{notebox}
+\flag{--internal} запрещает маршрутизацию наружу, но не заменяет
+firewall на хосте. Контейнеры во внутренней сети всё равно доступны
+друг другу, поэтому сегментируйте приложение по сетям.
+\end{notebox}
+
+\section{Ограничения ресурсов}
+
+Лимиты~--- не только производительность, но и защита от атак
+на истощение.
+
+\begin{code}[language=bash]
+$ docker run -d --name api \
+    --memory=512m --memory-swap=512m \
+    --cpus=1 \
+    --pids-limit=200 \
+    --ulimit nofile=1024:2048 \
+    api:1.0
+\end{code}
+
+В Compose те же параметры задаются в \cmd{deploy.resources.limits}
+и \cmd{pids\_limit} (в зависимости от версии Compose).
+
+\section{Аудит и соответствие}
+
+\begin{itemize}
+  \item \textbf{Docker Bench for Security}~--- скрипт проверки
+        конфигурации демона и хоста по рекомендациям CIS.
+  \item \textbf{Регулярные обновления}~--- ядро, Docker Engine,
+        базовые образы.
+  \item \textbf{Логи аудита}~--- кто запускал контейнеры и с какими
+        привилегиями.
+  \item \textbf{Политики}~--- запрет \flag{--privileged},
+        обязательные лимиты, разрешённые реестры.
+\end{itemize}
+
+\section{Чек-лист перед production}
+
+\begin{enumerate}
+  \item Процесс работает не от root, UID зафиксирован.
+  \item Корневая файловая система только для чтения, запись~--- в тома.
+  \item Сброшены capabilities, включён \cmd{no-new-privileges}.
+  \item Заданы лимиты памяти, CPU и числа процессов.
+  \item Секретов нет в образе, истории и переменных окружения.
+  \item Образ собран из минимальной базы и просканирован.
+  \item Базовые образы зафиксированы по версии или digest.
+  \item Наружу опубликованы только нужные порты.
+  \item Сокет Docker не смонтирован в приложение.
+  \item Настроены healthcheck, логи и обновление базовых образов.
+\end{enumerate}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Контейнер не равен виртуальной машине по уровню изоляции.
+  \item Минимальные привилегии: non-root, read-only, cap-drop,
+        лимиты.
+  \item Секреты~--- только во время запуска, не в слоях образа.
+  \item Образы нужно сканировать, подписывать и фиксировать по digest.
+  \item Сокет Docker равносилен root; используйте proxy, rootless
+        или отдельный демон.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Почему контейнер под root опаснее, чем процесс под обычным
+        пользователем?
+  \item Что делает \flag{--read-only} и куда тогда писать временные
+        файлы?
+  \item Почему секрет в \cmd{ARG} считается утёкшим?
+  \item Чем опасен смонтированный \file{/var/run/docker.sock}?
+  \item Какие меры снижают риск запуска заражённого образа?
+  \item Зачем нужен \flag{--pids-limit}?
+\end{selfcheck}

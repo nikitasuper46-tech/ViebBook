@@ -1,0 +1,330 @@
+\chapter{Установка и первый запуск}
+
+\section{Что именно устанавливать}
+
+Слово \enquote{Docker} сегодня обозначает несколько продуктов. Для обучения
+достаточно двух вариантов.
+
+\begin{description}[style=nextline]
+  \item[Docker Engine] Демон, CLI и плагины для Linux. Ставится пакетным
+        менеджером или официальным скриптом, работает без графической
+        оболочки. Это стандартный выбор для серверов и CI.
+  \item[Docker Desktop] Приложение для macOS, Windows и Linux с графическим
+        интерфейсом, Kubernetes, расширениями и удобным управлением
+        ресурсами. Внутри macOS и Windows содержит виртуальную машину
+        с Linux, потому что контейнеры используют ядро Linux.
+\end{description}
+
+Есть и совместимые альтернативы: Podman, Colima, Rancher Desktop.
+Команды почти совпадают, но в этой книге предполагается Docker Engine
+или Docker Desktop с CLI \cmd{docker}.
+
+\begin{notebox}
+Проверить, что уже установлено, можно командой \cmd{docker version}.
+Если команда не найдена~--- Docker нет в системе. Если найдена,
+но обращается к серверу с ошибкой~--- установлен только клиент
+или не запущен демон.
+\end{notebox}
+
+\section{Установка Docker Engine в Linux}
+
+\subsection{Быстрый путь: пакет из репозитория дистрибутива}
+
+В Debian и Ubuntu есть пакет \cmd{docker.io} с демоном и CLI.
+Он подходит для первых шагов, но может отставать от актуальной версии
+и не включать плагин Compose.
+
+\begin{code}[language=bash]
+$ sudo apt-get update
+$ sudo apt-get install -y docker.io
+$ sudo systemctl enable --now docker
+\end{code}
+
+В Fedora и RHEL аналогичную роль играет \cmd{podman-docker} или пакет
+\cmd{moby-engine}; для полноценной работы с Compose лучше официальный
+репозиторий Docker, описанный ниже.
+
+\begin{tipbox}
+Для учебной машины быстрый путь вполне допустим. Для production
+используйте официальный репозиторий: вы получите свежие исправления
+безопасности и единые версии на всех серверах.
+\end{tipbox}
+
+\subsection{Рекомендуемый путь: официальный репозиторий}
+
+Для Ubuntu и Debian установка состоит из четырёх шагов: подключить ключ,
+добавить репозиторий, обновить индексы и установить пакеты.
+
+\begin{code}[language=bash]
+$ sudo apt-get update
+$ sudo apt-get install -y ca-certificates curl
+$ sudo install -m 0755 -d /etc/apt/keyrings
+$ sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    -o /etc/apt/keyrings/docker.asc
+$ sudo chmod a+r /etc/apt/keyrings/docker.asc
+$ echo "deb [arch=$(dpkg --print-architecture) \
+    signed-by=/etc/apt/keyrings/docker.asc] \
+    https://download.docker.com/linux/ubuntu \
+    $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+$ sudo apt-get update
+$ sudo apt-get install -y docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin
+\end{code}
+
+Для Debian замените \cmd{ubuntu} на \cmd{debian} в URL репозитория,
+для других дистрибутивов используйте соответствующие команды
+\cmd{dnf} или \cmd{zypper}. Пакеты означают:
+
+\begin{itemize}
+  \item \cmd{docker-ce}~--- демон;
+  \item \cmd{docker-ce-cli}~--- клиент \cmd{docker};
+  \item \cmd{containerd.io}~--- среда выполнения;
+  \item \cmd{docker-buildx-plugin}~--- расширенная сборка (BuildKit);
+  \item \cmd{docker-compose-plugin}~--- команда \cmd{docker compose}.
+\end{itemize}
+
+\begin{warnbox}
+Скрипт \cmd{curl -fsSL https://get.docker.com | sh} удобен для быстрых
+экспериментов, но не подходит для управляемых серверов: он не фиксирует
+версию, не проверяет пакеты и выполняет удалённый код от имени root.
+В production устанавливайте пакеты явно.
+\end{warnbox}
+
+\section{Проверка установки}
+
+\begin{code}[language=bash]
+$ docker version
+Client: Docker Engine - Community
+ Version:           29.1.5
+ ...
+Server: Docker Engine - Community
+ Engine:
+  Version:          29.1.5
+  Storage Driver:   overlay2
+  Cgroup Driver:    systemd
+  Cgroup Version:   2
+  ...
+\end{code}
+
+Обратите внимание на три поля в секции \cmd{Server}:
+
+\begin{itemize}
+  \item \cmd{Storage Driver}~--- драйвер слоистой файловой системы.
+        На современных Linux это \cmd{overlay2}.
+  \item \cmd{Cgroup Version}~--- версия контрольных групп. Вторая версия
+        предпочтительна.
+  \item \cmd{Server Version}~--- версия демона. Если секции \cmd{Server}
+        нет вовсе, клиент не смог связаться с демоном.
+\end{itemize}
+
+Более подробную информацию, включая путь к данным, список плагинов
+и настройки ядра, выводит \cmd{docker info}.
+
+\section{Права доступа к демону}
+
+Демон слушает Unix-сокет \file{/var/run/docker.sock}, принадлежащий
+пользователю \cmd{root} и группе \cmd{docker}. Поэтому обычный
+пользователь получает \enquote{permission denied}. Есть два решения.
+
+\subsection{Добавить пользователя в группу docker}
+
+\begin{code}[language=bash]
+$ sudo usermod -aG docker $USER
+$ newgrp docker    # применить группу в текущей сессии
+\end{code}
+
+После повторного входа в систему проверьте:
+
+\begin{code}[language=bash]
+$ docker run --rm hello-world
+\end{code}
+
+\begin{warnbox}
+Членство в группе \cmd{docker} фактически даёт права root: через демон
+можно запустить привилегированный контейнер и смонтировать каталоги
+хоста. На общих машинах это неприемлемо. Предпочтительный вариант
+для рабочих станций~--- rootless-режим.
+\end{warnbox}
+
+\subsection{Rootless-режим}
+
+Rootless-режим запускает демон и контейнеры от имени обычного
+пользователя, используя user namespaces. Установка выполняется
+отдельным пакетом:
+
+\begin{code}[language=bash]
+$ sudo apt-get install -y docker-ce-rootless-extras
+$ dockerd-rootless-setuptool.sh install
+$ systemctl --user enable --now docker
+$ export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock
+\end{code}
+
+Ограничения rootless: нельзя слушать порты ниже 1024 без
+дополнительных настроек, некоторые драйверы и функции (например,
+некоторые сетевые режимы) недоступны. Зато компрометация контейнера
+не даёт root на хосте. Подробнее~--- в разделе~12.3.
+
+\section{Docker Desktop}
+
+В macOS и Windows установите Docker Desktop с официального сайта
+и запустите его. Проверьте, что в трее появился значок Docker, а команда
+\cmd{docker version} показывает и клиент, и сервер.
+
+Полезные настройки:
+
+\begin{itemize}
+  \item \textbf{Resources}~--- сколько процессоров, памяти и диска отдать
+        виртуальной машине Docker. Для комфортной работы обычно достаточно
+        4~CPU и 8~ГБ памяти.
+  \item \textbf{File sharing}~--- какие каталоги хоста доступны для привязок.
+        На macOS привязка каталогов вне разрешённых путей может работать
+        медленно или не работать вовсе.
+  \item \textbf{General $\rightarrow$ Start Docker Desktop when you sign in}~---
+        автозапуск, чтобы не забывать про демон.
+\end{itemize}
+
+\begin{notebox}
+В Windows Docker Desktop использует WSL~2. Держите дистрибутив WSL
+на той же файловой системе, где лежит проект: привязка каталогов
+с диска \cmd{C:} в WSL заметно медленнее, чем работа внутри дистрибутива WSL.
+\end{notebox}
+
+\section{Первый контейнер}
+
+Убедимся, что всё работает, на классическом примере.
+
+\begin{code}[language=bash]
+$ docker run --rm hello-world
+
+Unable to find image 'hello-world:latest' locally
+latest: Pulling from library/hello-world
+...
+Hello from Docker!
+This message shows that your installation appears to be working correctly.
+...
+\end{code}
+
+Что произошло по шагам:
+
+\begin{enumerate}
+  \item клиент отправил запрос демону;
+  \item демон не нашёл образ локально и скачал его из Docker Hub;
+  \item из образа был создан контейнер, выполнивший программу \cmd{/hello};
+  \item программа напечатала текст и завершилась;
+  \item флаг \flag{--rm} удалил контейнер сразу после выхода.
+\end{enumerate}
+
+Теперь запустим что-то полезное~--- веб-сервер nginx.
+
+\begin{code}[language=bash]
+$ docker run -d --name web -p 8080:80 nginx:alpine
+$ docker ps
+CONTAINER ID   IMAGE          COMMAND                  CREATED         STATUS         PORTS                  NAMES
+a1b2c3d4e5f6   nginx:alpine   "/docker-entrypoint.…"   5 seconds ago   Up 5 seconds   0.0.0.0:8080->80/tcp   web
+$ curl -I http://localhost:8080
+HTTP/1.1 200 OK
+Server: nginx/1.27.3
+...
+\end{code}
+
+Разберём флаги:
+
+\begin{itemize}
+  \item \flag{-d}~--- запустить в фоне (detached);
+  \item \flag{--name web}~--- дать контейнеру имя вместо случайного;
+  \item \flag{-p 8080:80}~--- опубликовать порт 80 контейнера
+        на порту 8080 хоста;
+  \item \cmd{nginx:alpine}~--- имя образа и тег.
+\end{itemize}
+
+Остановим и удалим контейнер:
+
+\begin{code}[language=bash]
+$ docker stop web
+$ docker rm web
+\end{code}
+
+\begin{tipbox}
+Интерактивный эксперимент удобно проводить командой
+\cmd{docker run --rm -it alpine sh}: флаг \flag{-i} оставляет stdin
+открытым, \flag{-t} выделяет псевдотерминал, \flag{--rm} убирает
+контейнер после выхода из оболочки.
+\end{tipbox}
+
+\section{Настройка демона}
+
+Основные параметры демона задаются в файле \file{/etc/docker/daemon.json}.
+После изменения файла демон нужно перезапустить.
+
+\begin{code}[language=bash]
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "live-restore": true
+}
+\end{code}
+
+\begin{itemize}
+  \item \cmd{log-driver} и \cmd{log-opts} ограничивают размер журналов
+        контейнеров. Без ограничения файлы журналов могут занять весь диск.
+  \item \cmd{live-restore} позволяет контейнерам пережить перезапуск
+        демона (не работает в режиме Swarm).
+\end{itemize}
+
+\begin{warnbox}
+Не редактируйте \file{daemon.json} вслепую: неверный JSON не даст демону
+запуститься. Проверяйте синтаксис, например
+\cmd{python3 -m json.tool /etc/docker/daemon.json}, и держите копию
+рабочей конфигурации.
+\end{warnbox}
+
+\section{Если что-то пошло не так}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}XX@{}}
+\toprule
+\textbf{Симптом} & \textbf{Что проверить} \\
+\midrule
+\cmd{permission denied ... docker.sock} & пользователь не в группе
+\cmd{docker} или не включён rootless-режим \\
+\cmd{Cannot connect to the Docker daemon} & демон не запущен:
+\cmd{systemctl status docker}; проверьте \envvar{DOCKER\_HOST} \\
+\cmd{port is already allocated} & порт занят другим процессом:
+\cmd{ss -ltnp} или смените порт хоста \\
+\cmd{no space left on device} & \cmd{docker system df}; очистите
+неиспользуемые образы и тома \\
+\cmd{pull access denied} или превышен лимит & выполните
+\cmd{docker login} и проверьте имя образа \\
+ошибки \cmd{iptables} при старте & конфликт с firewall или nftables;
+смотрите \cmd{journalctl -u docker} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{summarybox}
+\begin{itemize}
+  \item На Linux ставьте Docker Engine из официального репозитория;
+        на macOS и Windows удобнее Docker Desktop.
+  \item После установки проверьте \cmd{docker version} и \cmd{docker info}.
+  \item Доступ к сокету~--- это фактически root; используйте группу
+        \cmd{docker} осознанно или rootless-режим.
+  \item Первый контейнер запускается командой \cmd{docker run},
+        а \flag{-d}, \flag{-p} и \flag{--name}~--- три флага, которые
+        понадобятся чаще всего.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Чем Docker Engine отличается от Docker Desktop?
+  \item Почему обычный пользователь не может подключиться к сокету Docker?
+  \item Какие три поля вывода \cmd{docker version} стоит проверить сразу
+        после установки?
+  \item Что делает флаг \flag{--rm} и чем он отличается от \cmd{docker rm}?
+  \item Зачем ограничивать размер журналов контейнеров?
+\end{selfcheck}

@@ -1,0 +1,314 @@
+\chapter{Данные: тома и привязки}
+
+Записываемый слой контейнера исчезает вместе с контейнером. Это
+правильное поведение: контейнеры должны быть взаимозаменяемыми,
+а состояние~--- жить отдельно. В главе разобраны три способа подключить
+данные~--- тома, привязки каталогов и \cmd{tmpfs},~--- а также резервное
+копирование, права доступа и типичные ошибки при работе с базами данных.
+
+\section{Почему данные нельзя хранить в контейнере}
+
+\begin{code}[language=bash]
+$ docker run --rm -it alpine sh
+/ # echo "важные данные" > /data.txt
+/ # exit
+$ docker run --rm -it alpine cat /data.txt
+cat: can't open '/data.txt': No such file or directory
+\end{code}
+
+Второй контейнер создан из того же образа, но его записываемый слой
+пуст. Данные первого контейнера исчезли вместе с ним. Даже если
+контейнер не удалять, обновление версии приложения обычно означает
+создание нового контейнера из нового образа~--- и снова чистое
+состояние.
+
+\begin{defbox}[title={Определение: том}]
+\textbf{Том} (\emph{volume})~--- хранилище, управляемое Docker, которое
+существует независимо от контейнеров и монтируется в их файловую
+систему. Тома живут в каталоге данных Docker (обычно
+\file{/var/lib/docker/volumes}) и удаляются только явно.
+\end{defbox}
+
+\section{Три способа подключения данных}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  host/.style={draw=accent!55!black, fill=accent!8, rounded corners=2pt,
+    minimum width=3.6cm, minimum height=1.0cm, align=center},
+  cont/.style={draw=good!60!black, fill=good!8, rounded corners=2pt,
+    minimum width=3.4cm, minimum height=1.0cm, align=center},
+  arr/.style={-Latex, thick, accent!70},
+  lbl/.style={font=\sffamily\scriptsize, text=muted},
+]
+  % bind
+  \node[host] (h1) at (0,2.2) {каталог хоста\\\cmd{/home/user/site}};
+  \node[cont] (c1) at (7.0,2.2) {контейнер\\\cmd{/usr/share/nginx/html}};
+  \draw[arr] (h1) -- node[above, lbl] {bind mount} node[below, lbl] {вы сами управляете} (c1);
+
+  % volume
+  \node[host] (h2) at (0,0.7) {том \cmd{pgdata}, управляет Docker\\\cmd{/var/lib/docker/volumes/...}};
+  \node[cont] (c2) at (7.0,0.7) {контейнер\\\cmd{/var/lib/postgresql/data}};
+  \draw[arr] (h2) -- node[above, lbl] {volume} node[below, lbl] {данные переживают контейнер} (c2);
+
+  % tmpfs
+  \node[host] (h3) at (0,-0.8) {оперативная память\\ядра};
+  \node[cont] (c3) at (7.0,-0.8) {контейнер\\\cmd{/tmp}};
+  \draw[arr] (h3) -- node[above, lbl] {tmpfs} node[below, lbl] {исчезает при остановке} (c3);
+\end{tikzpicture}
+\caption{Три способа подключения данных: привязка каталога, том Docker
+и tmpfs в памяти}\label{fig:mounts}
+\end{figure}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lXXX@{}}
+\toprule
+ & \textbf{Том} & \textbf{Привязка} & \textbf{tmpfs} \\
+\midrule
+Где хранится & каталог данных Docker & любой путь хоста & память \\
+Кто управляет & Docker & вы & ядро \\
+Живёт после удаления контейнера & да & да & нет \\
+Резервное копирование & \cmd{docker run tar} или приложение & обычные средства
+хоста & не требуется \\
+Типичное применение & базы данных, состояние сервисов & конфигурации,
+исходный код при разработке & кэш, временные файлы, секреты \\
+Скорость & высокая & зависит от ФС (на macOS медленнее) & очень высокая \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Именованные и анонимные тома}
+
+\begin{code}[language=bash]
+$ docker volume create pgdata
+$ docker volume ls
+DRIVER    VOLUME NAME
+local     pgdata
+$ docker volume inspect pgdata
+[
+    {
+        "Name": "pgdata",
+        "Driver": "local",
+        "Mountpoint": "/var/lib/docker/volumes/pgdata/_data",
+        ...
+    }
+]
+\end{code}
+
+Подключение:
+
+\begin{code}[language=bash]
+$ docker run -d --name db \
+    -e POSTGRES_PASSWORD=secret \
+    -v pgdata:/var/lib/postgresql/data \
+    postgres:17
+
+$ docker inspect db --format '{{json .Mounts}}'
+[{"Type":"volume","Name":"pgdata","Destination":"/var/lib/postgresql/data",...}]
+\end{code}
+
+Если указать только путь внутри контейнера (\flag{-v /var/lib/data}),
+Docker создаст \emph{анонимный} том со случайным именем. Он переживёт
+перезапуск контейнера, но его легко потерять: \cmd{docker rm -v}
+удаляет анонимные тома вместе с контейнером, а \cmd{docker volume prune}
+убирает все неиспользуемые.
+
+\begin{code}[language=bash]
+$ docker run --rm -v /var/lib/data alpine ls /var/lib/data
+$ docker volume ls -f dangling=true
+$ docker volume rm pgdata            # только если том не используется
+$ docker volume prune                # удалить все неиспользуемые тома
+\end{code}
+
+\begin{warnbox}
+\cmd{docker volume prune} не спрашивает подтверждения в некоторых
+версиях и удаляет данные безвозвратно. Убедитесь, что среди
+неиспользуемых томов нет резервных копий или баз, к которым вы
+планируете вернуться.
+\end{warnbox}
+
+\section{Привязки каталогов}
+
+Привязка (\emph{bind mount}) монтирует каталог или файл хоста внутрь
+контейнера. Это основной инструмент разработки: изменения в файлах
+сразу видны приложению.
+
+\begin{code}[language=bash]
+$ docker run -d --name web -p 8080:80 \
+    --mount type=bind,src="$(pwd)/site",dst=/usr/share/nginx/html,readonly \
+    nginx:1.27-alpine
+
+# эквивалентная краткая запись
+$ docker run -d --name web2 -p 8081:80 \
+    -v "$(pwd)/site:/usr/share/nginx/html:ro" \
+    nginx:1.27-alpine
+\end{code}
+
+\begin{notebox}
+\cmd{-v} и \cmd{--mount} решают одну задачу, но \cmd{--mount}
+явнее и безопаснее: если источник не существует, он завершится
+с ошибкой, а \cmd{-v} молча создаст каталог на хосте от имени root.
+В скриптах и документации предпочитайте \cmd{--mount}.
+\end{notebox}
+
+Права и SELinux:
+
+\begin{itemize}
+  \item \cmd{:ro}~--- только чтение;
+  \item \cmd{:z}~--- перемаркировать каталог для SELinux с разделением
+        между контейнерами;
+  \item \cmd{:Z}~--- эксклюзивная метка для одного контейнера.
+\end{itemize}
+
+\begin{warnbox}
+Права доступа внутри контейнера определяются UID/GID процесса,
+а не именем пользователя. Если приложение работает от UID 10001,
+а каталог на хосте принадлежит UID 1000, запись не удастся.
+Проверяйте \cmd{ls -ln}, а не \cmd{ls -l}, и выравнивайте UID.
+\end{warnbox}
+
+\section{tmpfs}
+
+Временное хранилище в оперативной памяти. Подходит для кэша, сокетов,
+временных файлов и данных, которые не должны попасть на диск.
+
+\begin{code}[language=bash]
+$ docker run --rm -it --tmpfs /tmp:size=64m alpine sh
+$ docker run -d \
+    --mount type=tmpfs,dst=/run/app,tmpfs-size=32m,tmpfs-mode=1770 \
+    myapp:1.0
+\end{code}
+
+Содержимое \cmd{tmpfs} исчезает при остановке контейнера и занимает
+память хоста, учитываемую в лимите \flag{--memory}.
+
+\section{Практика: PostgreSQL с томом}
+
+Запустим базу с именованным томом, создадим данные, перезапустим
+контейнер и убедимся, что они сохранились.
+
+\begin{code}[language=bash]
+$ docker run -d --name db \
+    -e POSTGRES_PASSWORD=secret \
+    -e POSTGRES_DB=app \
+    -p 127.0.0.1:5432:5432 \
+    -v pgdata:/var/lib/postgresql/data \
+    postgres:17
+
+$ docker exec -it db psql -U postgres -d app -c \
+    "CREATE TABLE notes(id serial primary key, body text);"
+$ docker exec -it db psql -U postgres -d app -c \
+    "INSERT INTO notes(body) VALUES ('тома работают');"
+
+$ docker restart db
+$ docker exec -it db psql -U postgres -d app -c \
+    "SELECT * FROM notes;"
+ id |      body
+----+----------------
+  1 | тома работают
+(1 row)
+\end{code}
+
+Логическая резервная копия средствами PostgreSQL:
+
+\begin{code}[language=bash]
+$ docker exec -t db pg_dump -U postgres app > backup.sql
+$ docker exec -i db psql -U postgres app < backup.sql
+\end{code}
+
+Такая копия переносима между версиями и удобна для небольших баз.
+Для больших баз используют физические бэкапы и инструменты вроде
+pgBackRest, запуская их в отдельном контейнере с тем же томом.
+
+\section{Резервное копирование томов}
+
+Универсальный способ~--- подключить том и каталог хоста к временному
+контейнеру и упаковать данные.
+
+\begin{code}[language=bash]
+$ docker run --rm \
+    -v pgdata:/data \
+    -v "$(pwd)":/backup \
+    alpine \
+    tar czf /backup/pgdata.tar.gz -C /data .
+
+# восстановление
+$ docker run --rm \
+    -v pgdata:/data \
+    -v "$(pwd)":/backup \
+    alpine \
+    sh -c "cd /data && tar xzf /backup/pgdata.tar.gz"
+\end{code}
+
+\begin{warnbox}
+Не копируйте каталог данных работающей базы «на горячую» без
+согласованного бэкапа: файлы могут быть в несогласованном состоянии.
+Останавливайте базу, используйте \cmd{pg\_dump} или штатные средства
+резервного копирования.
+\end{warnbox}
+
+\section{Тонкости, о которых узнают поздно}
+
+\subsection{VOLUME в Dockerfile}
+
+Инструкция \cmd{VOLUME} объявляет точку монтирования. Данные,
+записанные в этот путь \emph{после} инструкции во время сборки,
+не сохраняются в образе: при запуске поверх будет пустой том.
+
+\begin{code}[language=dockerfile]
+VOLUME /var/lib/data
+RUN echo "данные" > /var/lib/data/file.txt   # этот файл не попадёт в образ
+\end{code}
+
+Поэтому данные приложения обычно готовят до \cmd{VOLUME} или вообще
+не объявляют том в Dockerfile, а задают его при запуске.
+
+\subsection{Права на именованный том}
+
+При первом подключении пустого именованного тома Docker копирует
+в него содержимое каталога из образа, включая владельца и права.
+Если каталог в образе принадлежит нужному UID, проблема решается
+сама. В противном случае используйте init-контейнер или
+\cmd{--user} с подходящим UID.
+
+\begin{code}[language=bash]
+$ docker run --rm -v pgdata:/data alpine chown -R 10001:10001 /data
+\end{code}
+
+\subsection{Копирование файлов без томов}
+
+Иногда достаточно \cmd{docker cp}: скопировать конфигурацию в контейнер
+или вытащить логи и артефакты.
+
+\begin{code}[language=bash]
+$ docker cp ./nginx.conf web:/etc/nginx/conf.d/default.conf
+$ docker cp web:/var/log/nginx/access.log ./access.log
+\end{code}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Записываемый слой эфемерен; состояние выносится в тома
+        или привязки.
+  \item Том управляется Docker и живёт до явного удаления; привязка~
+        это каталог хоста, которым управляете вы.
+  \item \cmd{tmpfs} хранит данные в памяти и исчезает при остановке.
+  \item Права определяются UID/GID, а не именами пользователей.
+  \item Резервное копирование томов делается через временный контейнер
+        с \cmd{tar}; базы данных лучше копировать их собственными
+        средствами.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Почему данные, записанные в контейнер, теряются при его удалении?
+  \item Чем именованный том отличается от анонимного?
+  \item Когда выбрать привязку каталога, а когда~--- том?
+  \item Что произойдёт с файлами, созданными в каталоге \cmd{VOLUME}
+        во время сборки?
+  \item Как сделать резервную копию тома и восстановить её?
+  \item Почему приложение не может писать в привязанный каталог,
+        хотя «права выставлены»?
+\end{selfcheck}

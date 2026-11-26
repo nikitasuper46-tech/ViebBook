@@ -1,0 +1,72 @@
+\documentclass[11pt,a4paper,oneside]{book}
+\input{preamble}
+\begin{document}
+\frontmatter
+\frontchapter{Предисловие}
+Проверка русского текста, «кавычек», тире~--- и дефиса. Ссылка \cmd{docker run}.
+
+\begin{defbox}
+Определение с \cmd{docker build} и подчёркиванием в \file{compose.yaml}.
+\end{defbox}
+
+\begin{warnbox}
+Внимание: не используйте \flag{--privileged} без необходимости.
+\end{warnbox}
+
+\begin{labbox}{Название работы}
+Текст задания с \cmd{docker ps -a}.
+\end{labbox}
+
+\begin{code}[listing options={language=dockerfile}]
+FROM nginx:1.27-alpine
+COPY ./site /usr/share/nginx/html
+EXPOSE 80
+# комментарий на русском
+CMD ["nginx", "-g", "daemon off;"]
+\end{code}
+
+\begin{code}[listing options={language=bash}]
+$ docker run -d --name web -p 8080:80 nginx:alpine
+$ docker logs -f web
+\end{code}
+
+\begin{code}[listing options={language=composeyaml}]
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+\end{code}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={draw=accent!60, fill=accent!8, rounded corners=2pt, inner sep=5pt},
+  arr/.style={-Latex, thick, accent!70}]
+  \node[box] (a) {Клиент};
+  \node[box, right=of a] (b) {Демон};
+  \draw[arr] (a) -- (b);
+\end{tikzpicture}
+\caption{Тестовая схема}\label{fig:test}
+\end{figure}
+
+\mainmatter
+\chapter{Проверка главы}
+Текст главы. См. рисунок~\ref{fig:test}.
+
+\section{Раздел}
+Абзац.
+
+\begin{summarybox}
+\begin{itemize}
+\item Пункт итогов.
+\end{itemize}
+\end{summarybox}
+
+\appendix
+\renewcommand{\chaptertitlename}{Приложение}
+\chapter{Тестовое приложение}
+Текст.
+
+\backmatter
+\end{document}

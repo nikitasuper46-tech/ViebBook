@@ -1,0 +1,286 @@
+% ============================================================
+%  Преамбула учебника «Основы Docker»
+%  Компиляция: lualatex (см. Makefile)
+% ============================================================
+
+% ---------- Шрифты и язык ----------
+\usepackage{fontspec}
+\setmainfont{PT Serif}[Ligatures=TeX]
+\setsansfont{PT Sans}[Ligatures=TeX]
+\setmonofont{PT Mono}[Scale=0.90, Ligatures=TeXOff]
+
+\usepackage[english,russian]{babel}
+\usepackage[autostyle]{csquotes}
+
+% ---------- Геометрия страницы ----------
+\usepackage[
+  a4paper,
+  top=2.5cm, bottom=2.7cm,
+  left=2.7cm, right=2.3cm,
+  headsep=0.8cm, footskip=1.2cm
+]{geometry}
+\raggedbottom
+\setlength{\parindent}{1.25em}
+\setlength{\parskip}{0.25em}
+\linespread{1.04}
+\emergencystretch=3em
+
+% ---------- Математика и таблицы ----------
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{enumitem}
+\setlist{itemsep=0.15em, topsep=0.35em, parsep=0.2em}
+\renewcommand{\arraystretch}{1.18}
+
+% ---------- Графика ----------
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{
+  arrows.meta, positioning, shapes.geometric, shapes.misc,
+  fit, backgrounds, calc, chains, shadows.blur,
+  decorations.pathreplacing
+}
+
+% ---------- Палитра ----------
+\definecolor{ink}{HTML}{1F2328}
+\definecolor{accent}{HTML}{14507A}      % основной синий
+\definecolor{accent2}{HTML}{0E86B8}     % голубой акцент
+\definecolor{accentpale}{HTML}{EAF3F9}
+\definecolor{warm}{HTML}{B45309}        % оранжевый
+\definecolor{good}{HTML}{1B6E4A}        % зелёный
+\definecolor{violet}{HTML}{5A3E9B}      % фиолетовый
+\definecolor{muted}{HTML}{6A737D}
+\definecolor{codebg}{HTML}{F6F8FA}
+\definecolor{codeframe}{HTML}{D8DEE4}
+\definecolor{rulegray}{HTML}{D0D7DE}
+\color{ink}
+
+% ---------- Гиперссылки ----------
+\usepackage[hidelinks]{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=accent,
+  urlcolor=accent2,
+  citecolor=accent,
+  pdftitle={Основы Docker. Учебник},
+  pdfsubject={Контейнеризация, Docker Engine, Docker Compose},
+  pdfkeywords={Docker, контейнеры, образы, Dockerfile, Compose, DevOps},
+  bookmarksnumbered=true,
+  bookmarksopen=true
+}
+\usepackage{bookmark}
+
+% ---------- Микротипографика ----------
+\usepackage{microtype}
+
+% ---------- Заголовки ----------
+\usepackage{titlesec}
+\titleformat{\chapter}[display]
+  {\sffamily\bfseries\raggedright}
+  {\normalsize\color{accent2}\MakeUppercase{\chaptertitlename}\ \thechapter}
+  {6pt}
+  {\fontsize{25}{29}\selectfont\color{accent}}
+  [\vspace{8pt}{\color{accent2}\rule{\textwidth}{1.1pt}}]
+\titlespacing*{\chapter}{0pt}{-6pt}{26pt}
+
+\titleformat{\section}
+  {\sffamily\bfseries\large\color{accent}}
+  {\thesection}{0.6em}{}
+\titlespacing*{\section}{0pt}{1.6em}{0.55em}
+
+\titleformat{\subsection}
+  {\sffamily\bfseries\normalsize\color{accent!90!black}}
+  {\thesubsection}{0.5em}{}
+\titlespacing*{\subsection}{0pt}{1.2em}{0.4em}
+
+\titleformat{\subsubsection}[runin]
+  {\sffamily\bfseries\normalsize\color{ink}}
+  {\thesubsubsection}{0.5em}{}[.\enspace]
+
+\titleformat{\part}[display]
+  {\sffamily\bfseries\centering}
+  {\Large\color{accent2}\MakeUppercase{\partname}\ \thepart}
+  {14pt}
+  {\fontsize{30}{34}\selectfont\color{accent}}
+  [\vspace{10pt}{\color{accent2}\rule{0.5\textwidth}{1.1pt}}]
+
+% ---------- Колонтитулы ----------
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\sffamily\color{muted}\nouppercase{\leftmark}}
+\fancyhead[R]{\small\sffamily\color{muted}\thepage}
+\setlength{\headheight}{22pt}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{rulegray}\leaders\hrule height \headrulewidth\hfill}}
+\fancypagestyle{plain}{%
+  \fancyhf{}%
+  \fancyfoot[C]{\small\sffamily\color{muted}\thepage}%
+  \renewcommand{\headrulewidth}{0pt}%
+}
+\renewcommand{\chaptermark}[1]{\markboth{\thechapter.\ #1}{}}
+\renewcommand{\sectionmark}[1]{}
+
+% ---------- Подписи ----------
+\usepackage[font=small,labelfont=bf,labelsep=period]{caption}
+
+% ---------- Коробки ----------
+\usepackage[most]{tcolorbox}
+\tcbset{
+  boxbase/.style={
+    enhanced,
+    breakable,
+    boxrule=0.4pt,
+    arc=2pt,
+    left=10pt, right=10pt, top=7pt, bottom=7pt,
+    before skip=10pt, after skip=10pt,
+    fonttitle=\sffamily\bfseries,
+    coltitle=accent!75!black,
+    attach title to upper={\par\vspace{0.25em}},
+  },
+  codebase/.style={
+    enhanced,
+    breakable,
+    boxrule=0.4pt,
+    arc=2pt,
+    left=8pt, right=8pt, top=6pt, bottom=6pt,
+    before skip=9pt, after skip=9pt,
+  }
+}
+
+\newtcolorbox{defbox}[1][]{%
+  boxbase,
+  colback=accent!5,
+  colframe=accent!45!black,
+  colbacktitle=accent!85!black,
+  title={\sffamily\bfseries Определение},
+  #1
+}
+
+\newtcolorbox{notebox}[1][]{%
+  boxbase,
+  colback=black!3,
+  colframe=black!35,
+  colbacktitle=black!55,
+  title={\sffamily\bfseries Замечание},
+  #1
+}
+
+\newtcolorbox{warnbox}[1][]{%
+  boxbase,
+  colback=warm!6,
+  colframe=warm!70!black,
+  colbacktitle=warm!85!black,
+  title={\sffamily\bfseries Важно},
+  #1
+}
+
+\newtcolorbox{tipbox}[1][]{%
+  boxbase,
+  colback=good!6,
+  colframe=good!65!black,
+  colbacktitle=good!80!black,
+  title={\sffamily\bfseries Совет},
+  #1
+}
+
+\newtcolorbox[auto counter, number within=chapter]{labbox}[2][]{%
+  boxbase,
+  colback=violet!5,
+  colframe=violet!65!black,
+  colbacktitle=violet!85!black,
+  title={\sffamily\bfseries Лабораторная работа \thetcbcounter. #2},
+  #1
+}
+
+\newtcolorbox{summarybox}[1][]{%
+  boxbase,
+  colback=accent2!7,
+  colframe=accent2!70!black,
+  colbacktitle=accent2!85!black,
+  title={\sffamily\bfseries Итоги главы},
+  #1
+}
+
+% ---------- Листинги ----------
+\usepackage{listings}
+\lstdefinestyle{dev}{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{accent}\bfseries,
+  commentstyle=\color{good!55!black},
+  stringstyle=\color{warm},
+  numbers=none,
+  breaklines=true,
+  breakatwhitespace=false,
+  breakindent=1.5em,
+  postbreak=\mbox{\textcolor{accent2}{$\hookrightarrow$}\space},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=2,
+  upquote=true,
+  extendedchars=true,
+  xleftmargin=0pt,
+  aboveskip=0pt,
+  belowskip=0pt,
+}
+
+\lstdefinelanguage{dockerfile}{
+  sensitive=true,
+  morekeywords={FROM,RUN,CMD,LABEL,MAINTAINER,EXPOSE,ENV,ADD,COPY,ENTRYPOINT,VOLUME,USER,WORKDIR,ARG,ONBUILD,STOPSIGNAL,HEALTHCHECK,SHELL,AS},
+  morecomment=[l]{\#},
+}
+
+\lstdefinelanguage{composeyaml}{
+  sensitive=false,
+  morekeywords={services,volumes,networks,image,build,container_name,ports,environment,env_file,depends_on,restart,healthcheck,command,entrypoint,profiles,secrets,configs,deploy,resources,limits,reservations,watch,develop,condition,test,interval,timeout,retries,start_period,target,context,dockerfile,args},
+  morecomment=[l]{\#},
+  morestring=[b]",
+  morestring=[b]',
+}
+
+\lstdefinelanguage{plain}{}
+
+\newcommand{\codesetup}{%
+  \lstset{style=dev,%
+    backgroundcolor=\color{codebg},%
+    frame=leftline,%
+    framerule=2.2pt,%
+    rulecolor=\color{accent2!75!black},%
+    framesep=7pt,%
+    xleftmargin=11pt,%
+    xrightmargin=4pt,%
+    aboveskip=9pt,%
+    belowskip=9pt,%
+  }%
+}
+
+\lstnewenvironment{code}[1][]{\codesetup\lstset{#1}}{}
+\lstnewenvironment{shell}[1][]{\codesetup\lstset{#1}}{}
+
+% ---------- Команды ----------
+\newcommand{\cmd}[1]{\texttt{#1}}
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\dcmd}[1]{\texttt{docker #1}}
+\newcommand{\envvar}[1]{\texttt{#1}}
+\newcommand{\flag}[1]{\texttt{#1}}
+
+% Ненумерованная глава с записью в содержание и колонтитул
+\newcommand{\frontchapter}[1]{%
+  \chapter*{#1}%
+  \addcontentsline{toc}{chapter}{#1}%
+  \markboth{#1}{}%
+}
+
+% Вопросы для самопроверки
+\newenvironment{selfcheck}
+  {\begin{enumerate}[label=\arabic*., leftmargin=2em, itemsep=0.3em]}
+  {\end{enumerate}}
+
+\setlength{\overfullrule}{6pt}

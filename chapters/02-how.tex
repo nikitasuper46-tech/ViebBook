@@ -1,0 +1,278 @@
+\chapter{Как устроена контейнеризация}
+
+Контейнер кажется магией только до тех пор, пока не увидишь, что под ним.
+Никакой эмуляции компьютера нет: ядро Linux умеет изолировать группы
+процессов, и Docker всего лишь удобно этим пользуется. В этой главе
+разобраны четыре механизма~--- пространства имён, контрольные группы,
+слоистая файловая система и клиент-серверная архитектура Docker,~---
+а затем прослежен путь команды \cmd{docker run} от терминала до процесса.
+
+\section{Пространства имён (namespaces)}
+
+Пространство имён~--- механизм ядра, который даёт процессу собственный
+взгляд на некоторый глобальный ресурс. Процессы в разных пространствах
+имён видят разные файловые системы, разные сетевые интерфейсы, разные
+списки процессов, хотя работают на одном ядре.
+
+\begin{table}[htbp]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+\textbf{Namespace} & \textbf{Что изолирует} & \textbf{Как это заметно} \\
+\midrule
+\cmd{pid} & номера процессов & внутри контейнера \cmd{ps} видит только
+процессы контейнера, главный из них имеет PID~1 \\
+\cmd{net} & интерфейсы, порты, маршруты, \cmd{iptables} & свой \cmd{localhost},
+свои порты, свой DNS \\
+\cmd{mnt} & точки монтирования & своя корневая файловая система \\
+\cmd{uts} & имя хоста и домен & \cmd{hostname} внутри не совпадает с хостом \\
+\cmd{ipc} & разделяемая память, семафоры, очереди & свои средства
+межпроцессного взаимодействия \\
+\cmd{user} & идентификаторы UID/GID & \cmd{root} внутри может быть обычным
+пользователем снаружи \\
+\cmd{cgroup} & видимая иерархия контрольных групп & контейнер не видит
+чужие лимиты \\
+\cmd{time} & системные часы & можно задать смещение времени (новый
+namespace в свежих ядрах) \\
+\bottomrule
+\end{tabularx}
+\caption{Пространства имён Linux, которые использует контейнер}\label{tab:namespaces}
+\end{table}
+
+Docker создаёт для контейнера набор пространств имён (кроме \cmd{user},
+если не включён rootless-режим или \cmd{userns-remap}). С точки зрения
+приложения оно выглядит как отдельная машина: свой хостнейм, свой
+\cmd{localhost}, свой корень файловой системы.
+
+\begin{notebox}
+Изоляцию можно увидеть без Docker. Команда
+\cmd{unshare --pid --fork --mount-proc ps aux} запускает \cmd{ps}
+в новом пространстве имён процессов: вы увидите только саму команду,
+а не сотни процессов хоста. Для этой команды нужны права root
+или включённые user namespaces.
+\end{notebox}
+
+\begin{warnbox}
+PID~1 внутри контейнера~--- это ваше приложение, а не \cmd{systemd}
+и не \cmd{init}. Оно обязано обрабатывать сигналы и \enquote{пожинать}
+зомби-процессы. Если приложение не умеет быть лидером, используйте
+флаг \flag{--init}: Docker добавит маленький init-процесс, который
+корректно передаёт сигналы и убирает зомби.
+\end{warnbox}
+
+\section{Контрольные группы (cgroups)}
+
+Пространства имён отвечают за \emph{что видно}, а контрольные группы~---
+за \emph{сколько можно}. Cgroups ограничивают и учитывают потребление
+ресурсов: процессорного времени, памяти, дискового ввода-вывода,
+числа процессов.
+
+Docker выставляет эти ограничения флагами команды \cmd{docker run}
+или в compose-файле:
+
+\begin{code}[language=bash]
+$ docker run --memory=512m --cpus=1.5 --pids-limit=100 nginx:alpine
+\end{code}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lXl@{}}
+\toprule
+\textbf{Флаг} & \textbf{Ограничение} & \textbf{Пример} \\
+\midrule
+\flag{--memory} & максимум оперативной памяти; при превышении процесс
+убивается (код 137) & \flag{--memory=512m} \\
+\flag{--memory-swap} & суммарный лимит памяти и swap & \flag{--memory-swap=1g} \\
+\flag{--cpus} & доля процессорного времени & \flag{--cpus=1.5} \\
+\flag{--cpu-shares} & относительный приоритет при конкуренции & \flag{--cpu-shares=512} \\
+\flag{--pids-limit} & максимальное число процессов и потоков & \flag{--pids-limit=200} \\
+\flag{--blkio-weight} & относительный приоритет дискового ввода-вывода & \flag{--blkio-weight=300} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Современные системы используют cgroups~v2 с единой иерархией; старые~---
+cgroups~v1 с отдельными контроллерами. Для пользователя Docker разница
+почти незаметна, но при отладке лимитов полезно знать, что смотреть нужно
+в \file{/sys/fs/cgroup}.
+
+\begin{tipbox}
+Лимит памяти~--- не украшение. Без \flag{--memory} один контейнер
+с утечкой памяти способен исчерпать память хоста и утащить за собой
+все остальные процессы. В production лимиты задавайте всегда, даже
+приблизительные.
+\end{tipbox}
+
+\section{Слоистая файловая система}
+
+Образ не копируется целиком при каждом запуске. Он хранится набором
+слоёв, доступных только для чтения, а драйвер \cmd{overlay2} собирает
+из них единое дерево. Сверху контейнер получает один записываемый слой.
+
+\begin{itemize}
+  \item \textbf{Чтение} идёт из нижних слоёв без изменений.
+  \item \textbf{Запись} в существующий файл вызывает copy-up: файл
+        копируется в верхний слой, и изменение применяется к копии.
+  \item \textbf{Удаление} файла из нижнего слоя создаёт белый маркер
+        (whiteout): файл скрыт, но остаётся в образе.
+  \item \textbf{Удаление контейнера} уничтожает его записываемый слой
+        вместе со всеми изменениями.
+\end{itemize}
+
+Отсюда два важных следствия. Во-первых, образ можно безопасно использовать
+для множества контейнеров: они не портят его слои. Во-вторых, данные,
+которые должны пережить контейнер, нужно выносить в тома или привязки
+(глава~7), а не хранить в записываемом слое.
+
+\begin{notebox}
+Слои разделяются между образами. Если десять образов основаны
+на \cmd{ubuntu:24.04}, базовый слой хранится на диске один раз.
+Поэтому \cmd{docker pull} второго похожего образа часто идёт быстро:
+большая часть слоёв уже есть локально.
+\end{notebox}
+
+\section{Клиент, демон и среда выполнения}
+
+Docker построен как клиент-серверная система. Команда \cmd{docker}
+не запускает контейнеры сама: она отправляет запрос по HTTP демону
+\cmd{dockerd}, который работает в фоне и делает всю работу.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=6mm and 7mm,
+  font=\sffamily\scriptsize,
+  every node/.style={align=center},
+  component/.style={draw=accent!55!black, fill=accent!7, rounded corners=2pt,
+    minimum width=2.35cm, minimum height=1.05cm, inner sep=3pt},
+  proc/.style={draw=warm!70!black, fill=warm!8, rounded corners=2pt,
+    minimum width=2.35cm, minimum height=1.05cm, inner sep=3pt},
+  registry/.style={draw=accent2!70!black, fill=accent2!7, dashed,
+    rounded corners=2pt, minimum width=2.6cm, minimum height=0.95cm, inner sep=3pt},
+  arr/.style={-Latex, thick, accent!70},
+  darr/.style={-Latex, thick, dashed, accent2!80!black},
+]
+  \node[registry] (reg) {реестр образов\\Docker Hub и др.};
+  \node[component, below=14mm of reg] (cli) {\textbf{docker CLI}\\[1pt]\cmd{docker run}};
+  \node[component, right=of cli] (dockerd) {\textbf{dockerd}\\[1pt]API, образы,\\сети, тома};
+  \node[component, right=of dockerd] (containerd) {\textbf{containerd}\\[1pt]управление\\жизненным циклом};
+  \node[component, right=of containerd] (shim) {\textbf{containerd-shim}\\[1pt]держит stdio,\\собирает код выхода};
+  \node[proc, right=of shim] (proc) {\textbf{процесс}\\[1pt]PID~1 в контейнере};
+
+  \draw[arr] (cli) -- node[above=1pt, text=muted] {HTTP} node[below=1pt, text=muted] {Unix-сокет} (dockerd);
+  \draw[arr] (dockerd) -- node[above=1pt, text=muted] {gRPC} (containerd);
+  \draw[arr] (containerd) -- node[above=1pt, text=muted] {задача} (shim);
+  \draw[arr] (shim) -- node[above=1pt, text=muted] {runc} (proc);
+  \draw[darr] (reg) -- node[right=2pt, text=muted] {pull/push} (dockerd);
+\end{tikzpicture}
+\caption{Путь команды \cmd{docker run}: клиент обращается к демону, тот
+передаёт работу containerd, а процесс создаётся низкоуровневой средой
+выполнения}\label{fig:architecture}
+\end{figure}
+
+Разберём элементы схемы.
+
+\begin{description}[style=nextline]
+  \item[docker CLI] Клиент командной строки. Ничего не знает о внутреннем
+        устройстве контейнеров: просто формирует HTTP-запросы и печатает
+        ответы. Может работать с удалённым демоном.
+  \item[dockerd] Демон Docker. Принимает API-запросы, управляет образами,
+        томами, сетями, а создание контейнеров делегирует containerd.
+  \item[containerd] Менеджер контейнеров: скачивает образы, распаковывает
+        слои, запускает задачи, следит за жизненным циклом. Именно его
+        использует Kubernetes, поэтому контейнеры Docker и Kubernetes
+        совместимы на уровне образов.
+  \item[containerd-shim] Небольшой процесс-посредник. Позволяет демону
+        перезапускаться, не убивая контейнеры, удерживает потоки
+        ввода-вывода и сообщает код выхода.
+  \item[runc] Реализация стандарта OCI Runtime. Получает bundle с корневой
+        файловой системой и конфигурацией, вызывает \cmd{clone()}
+        с нужными namespaces, настраивает cgroups, монтирует rootfs
+        и выполняет \cmd{exec} команды. После запуска процесса runc
+        завершается~--- контейнер живёт без него.
+\end{description}
+
+\begin{notebox}
+Docker Desktop для macOS и Windows запускает \cmd{dockerd} внутри
+лёгкой виртуальной машины, потому что ядро этих систем не является
+Linux. С точки зрения CLI всё выглядит так же, но путь к сокету
+и производительность файловой системы отличаются от Linux.
+\end{notebox}
+
+\section{Что происходит при \cmd{docker run nginx:alpine}}
+
+Полезно один раз проследить всю цепочку целиком.
+
+\begin{enumerate}
+  \item CLI разбирает аргументы и отправляет демону запрос
+        \cmd{POST /containers/create}.
+  \item Демон проверяет, есть ли образ \cmd{nginx:alpine} локально.
+        Если нет~--- обращается к реестру, скачивает манифест и слои,
+        проверяя контрольные суммы.
+  \item Слои распаковываются в хранилище образов (snapshotter);
+        из них собирается корневая файловая система контейнера.
+  \item Создаются метаданные контейнера, выделяется сетевой адрес,
+        подготавливаются точки монтирования томов и конфигурация.
+  \item containerd получает задачу, запускает shim, а тот вызывает runc.
+  \item runc создаёт пространства имён и cgroups, делает \cmd{pivot\_root}
+        в файловую систему образа и запускает процесс \cmd{nginx}.
+  \item runc завершается; shim остаётся, удерживая stdio и ожидая
+        код выхода. Процесс \cmd{nginx} становится PID~1 внутри контейнера.
+\end{enumerate}
+
+\begin{notebox}
+Команда \cmd{docker run}~--- это сокращение для \cmd{docker create}
+и \cmd{docker start}. Если нужно подготовить контейнер, но не запускать
+его, используйте \cmd{docker create}; подробнее~--- в главе~5.
+\end{notebox}
+
+\section{Куда CLI отправляет команды}
+
+По умолчанию клиент подключается к локальному демону.
+Канал связи~--- Unix-сокет \file{/var/run/docker.sock}.
+Это поведение можно изменить:
+
+\begin{code}[language=bash]
+$ docker context ls
+$ docker context create remote --docker "host=ssh://user@server"
+$ docker context use remote
+$ docker --context default ps
+$ export DOCKER_HOST=ssh://user@server
+\end{code}
+
+Контексты удобны, когда нужно переключаться между локальным Docker,
+удалённым сервером и кластером. Переменная \envvar{DOCKER\_HOST}~
+более старый способ; контекст имеет приоритет и хранит дополнительные
+настройки.
+
+\begin{warnbox}
+Доступ к \file{/var/run/docker.sock} равносилен доступу root на хосте:
+через демон можно смонтировать корень хоста внутрь контейнера.
+Не добавляйте посторонних пользователей в группу \cmd{docker}
+на общих машинах и не пробрасывайте сокет в недоверенные контейнеры.
+Подробнее~--- в главе~12.
+\end{warnbox}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Контейнер~--- это процесс с набором namespaces и лимитами cgroups.
+  \item Namespaces изолируют видимость ресурсов, cgroups~--- потребление.
+  \item Образы состоят из неизменяемых слоёв; контейнер получает
+        один записываемый слой, который исчезает при удалении.
+  \item Docker~--- клиент-серверная система: CLI общается с \cmd{dockerd},
+        тот делегирует containerd, а процесс создаёт runc.
+  \item Сокет Docker~--- мощный и опасный интерфейс; доступ к нему нужно
+        контролировать.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Какие пространства имён создаёт Docker и что изолирует каждое?
+  \item Чем namespace отличается от cgroup?
+  \item Что такое copy-up и whiteout в overlayfs?
+  \item Почему runc завершается, а контейнер продолжает работать?
+  \item Что делает containerd-shim и зачем он нужен?
+  \item Чем опасен смонтированный в контейнер \file{/var/run/docker.sock}?
+\end{selfcheck}

@@ -1,0 +1,592 @@
+\chapter{Dockerfile: сборка образов}
+
+Dockerfile~--- текстовое описание того, как собрать образ. Это самый
+важный файл в проекте: от него зависят скорость сборки, размер образа,
+воспроизводимость и безопасность. В главе разобраны все основные
+инструкции, разница между \cmd{CMD} и \cmd{ENTRYPOINT}, порядок
+инструкций и кэш слоёв, многоэтапная сборка и современные возможности
+BuildKit.
+
+\section{Как работает сборка}
+
+Команда \cmd{docker build} отправляет демону \emph{контекст сборки}~---
+каталог, в котором лежит Dockerfile,~--- и последовательно выполняет
+инструкции. Каждая инструкция, меняющая файловую систему, создаёт новый
+слой поверх предыдущего. Результат~--- образ.
+
+\begin{code}[language=bash]
+$ mkdir hello-docker && cd hello-docker
+$ cat > Dockerfile <<'EOF'
+FROM alpine:3.21
+RUN echo "Привет из контейнера" > /hello.txt
+CMD ["cat", "/hello.txt"]
+EOF
+$ docker build -t hello:1.0 .
+$ docker run --rm hello:1.0
+Привет из контейнера
+\end{code}
+
+\begin{warnbox}
+Точка в конце команды~--- это контекст сборки, а не «просто так».
+\cmd{docker build -t app .} отправляет демону всё содержимое текущего
+каталога, кроме перечисленного в \file{.dockerignore}. Сборка
+из корня домашнего каталога может занять минуты и отправить гигабайты
+мусора.
+\end{warnbox}
+
+\begin{defbox}
+\textbf{Контекст сборки}~--- набор файлов, доступных инструкциям
+\cmd{COPY} и \cmd{ADD}. Инструкции \cmd{RUN} выполняются внутри
+контейнера-сборщика и не видят файлы хоста напрямую.
+\end{defbox}
+
+\section{Первый настоящий Dockerfile}
+
+Соберём небольшой веб-сервис на Python и Flask.
+
+\begin{code}[language=bash]
+$ tree
+.
+├── Dockerfile
+├── app.py
+└── requirements.txt
+\end{code}
+
+\begin{code}[language=python]
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.get("/")
+def index():
+    return {"status": "ok", "service": "demo"}
+
+@app.get("/health")
+def health():
+    return {"healthy": True}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
+\end{code}
+
+\begin{code}
+flask==3.1.0
+\end{code}
+
+\begin{code}[language=dockerfile]
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app.py .
+
+EXPOSE 8000
+USER 10001
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')" || exit 1
+
+CMD ["python", "app.py"]
+\end{code}
+
+Сборка и запуск:
+
+\begin{code}[language=bash]
+$ docker build -t demo-api:1.0 .
+$ docker run -d --name api -p 8000:8000 demo-api:1.0
+$ curl http://localhost:8000/
+{"service":"demo","status":"ok"}
+$ docker ps --filter name=api --format '{{.Status}}'
+Up 12 seconds (healthy)
+\end{code}
+
+Обратите внимание на порядок: сначала копируется только
+\file{requirements.txt}, затем устанавливаются зависимости и только
+потом~--- код. При изменении \file{app.py} Docker переиспользует слой
+с зависимостями и не выполняет \cmd{pip install} заново.
+
+\section{Инструкции Dockerfile}
+
+\subsection{FROM}
+
+Задаёт базовый образ. Должна быть первой инструкцией (кроме \cmd{ARG}
+до неё).
+
+\begin{code}[language=dockerfile]
+FROM python:3.13-slim
+FROM node:22-alpine AS build
+FROM scratch
+\end{code}
+
+\begin{itemize}
+  \item \cmd{scratch}~--- пустой образ. Используется для статических
+        бинарников и минимальных образов.
+  \item \cmd{AS имя}~--- имя этапа для многоэтапной сборки.
+  \item Всегда фиксируйте версию: \cmd{python:3.13-slim} лучше, чем
+        \cmd{python:latest}.
+\end{itemize}
+
+\subsection{RUN}
+
+Выполняет команду в новом слое во время сборки.
+
+\begin{code}[language=dockerfile]
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir -r requirements.txt
+\end{code}
+
+\begin{warnbox}
+Каждый \cmd{RUN} создаёт слой. Раздельные команды
+\cmd{RUN apt-get update} и \cmd{RUN apt-get install}~--- плохая идея:
+кэш обновится, а слой установки останется старым. Объединяйте связанные
+команды через \cmd{\&\&} и удаляйте временные файлы в том же слое.
+\end{warnbox}
+
+\subsection{COPY и ADD}
+
+Копируют файлы из контекста в образ.
+
+\begin{code}[language=dockerfile]
+COPY package.json package-lock.json ./
+COPY --chown=app:app ./src /app/src
+COPY --chmod=755 entrypoint.sh /usr/local/bin/entrypoint.sh
+\end{code}
+
+\begin{itemize}
+  \item \cmd{COPY}~--- предсказуемое копирование. Используйте его
+        по умолчанию.
+  \item \cmd{ADD} умеет распаковывать локальные tar-архивы и скачивать
+        URL. Скачивание по URL лучше заменить на \cmd{RUN curl},
+        чтобы контролировать проверку контрольной суммы; распаковку
+        архива~--- на \cmd{COPY} + \cmd{RUN tar}.
+\end{itemize}
+
+\subsection{WORKDIR}
+
+Задаёт рабочий каталог для последующих инструкций и создаёт его,
+если он не существует.
+
+\begin{code}[language=dockerfile]
+WORKDIR /app
+\end{code}
+
+Не используйте \cmd{RUN cd /app}: эта команда действует только внутри
+своего слоя и не влияет на следующие инструкции.
+
+\subsection{ENV и ARG}
+
+Обе инструкции задают переменные, но с разными целями.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+ & \textbf{ARG} & \textbf{ENV} \\
+\midrule
+Когда доступна & только во время сборки & при сборке и в работающем
+контейнере \\
+Сохраняется в образе & нет (кроме случаев, когда попала в слой) &
+да, в конфигурации образа \\
+Переопределение & \flag{--build-arg} & \flag{-e} или \cmd{environment}
+в Compose \\
+Типичное применение & версии, флаги сборки & конфигурация приложения \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{code}[language=dockerfile]
+ARG PYTHON_VERSION=3.13
+FROM python:${PYTHON_VERSION}-slim
+
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION} \
+    TZ=Europe/Moscow
+\end{code}
+
+\begin{warnbox}
+\cmd{ARG} не подходит для секретов. Значение аргумента попадает
+в историю сборки и может быть извлечено из образа. Для паролей
+и токенов используйте \flag{--secret} (раздел~6.8) или переменные
+окружения при запуске.
+\end{warnbox}
+
+\subsection{EXPOSE}
+
+Документирует порт, который слушает приложение. \cmd{EXPOSE} не
+публикует порт: для этого нужен \flag{-p} при запуске. Инструкция
+полезна как подсказка людям и инструментам.
+
+\begin{code}[language=dockerfile]
+EXPOSE 8000
+EXPOSE 8000/tcp 9090/udp
+\end{code}
+
+\subsection{USER}
+
+Задаёт пользователя, от имени которого работает контейнер.
+
+\begin{code}[language=dockerfile]
+RUN useradd --create-home --uid 10001 app
+USER app
+\end{code}
+
+В Debian/Ubuntu-образах удобно \cmd{useradd}; в Alpine~---
+\cmd{adduser -D -u 10001 app}. Можно указать числовой UID без создания
+пользователя: \cmd{USER 10001}. Kubernetes и некоторые системы
+безопасности предпочитают именно числовые UID.
+
+\subsection{CMD и ENTRYPOINT}
+
+Это самая частая тема ошибок. \cmd{ENTRYPOINT} задаёт исполняемый файл,
+\cmd{CMD}~--- аргументы по умолчанию (или команду, если
+\cmd{ENTRYPOINT} нет).
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+\textbf{В Dockerfile} & \textbf{Что выполнится} & \textbf{\cmd{docker run img ARG}} \\
+\midrule
+только \cmd{CMD} & \cmd{CMD} целиком & заменяет \cmd{CMD} \\
+только \cmd{ENTRYPOINT} & \cmd{ENTRYPOINT} & добавляется аргументом \\
+оба & \cmd{ENTRYPOINT} + \cmd{CMD} & заменяет \cmd{CMD}, \cmd{ENTRYPOINT}
+остаётся \\
+ни одного & ошибка при запуске &~--- \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{code}[language=dockerfile]
+# Вариант 1: ENTRYPOINT + аргументы по умолчанию
+ENTRYPOINT ["python", "app.py"]
+CMD ["--port", "8000"]
+
+# Вариант 2: только CMD, легко переопределить целиком
+CMD ["python", "app.py"]
+\end{code}
+
+\begin{code}[language=bash]
+$ docker run --rm demo-api:1.0 --port 9000      # аргументы к ENTRYPOINT
+$ docker run --rm --entrypoint sh demo-api:1.0  # временно заменить ENTRYPOINT
+\end{code}
+
+\begin{warnbox}
+Используйте \emph{exec-форму} (\cmd{["python", "app.py"]}), а не
+shell-форму (\cmd{python app.py}). В shell-форме команда запускается
+через \cmd{/bin/sh -c}, и сигнал \cmd{SIGTERM} не доходит до приложения:
+\cmd{docker stop} будет ждать таймаут и затем убивать процесс.
+Shell-форма нужна только там, где действительно требуется подстановка
+переменных или конвейер.
+\end{warnbox}
+
+Если приложению нужны и подстановки, и корректные сигналы, используйте
+entrypoint-скрипт с \cmd{exec}:
+
+\begin{code}[language=bash]
+#!/bin/sh
+set -e
+echo "Запуск с PORT=$PORT"
+exec "$@"
+\end{code}
+
+\begin{code}[language=dockerfile]
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["entrypoint.sh"]
+CMD ["python", "app.py"]
+\end{code}
+
+\subsection{HEALTHCHECK}
+
+Позволяет Docker и Compose отличать «процесс жив» от «сервис отвечает».
+
+\begin{code}[language=dockerfile]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+\end{code}
+
+Параметры: \cmd{--interval}~--- как часто проверять, \cmd{--timeout}~
+--- сколько ждать ответа, \cmd{--start-period}~--- сколько дать
+приложению на старт, \cmd{--retries}~--- сколько неудач подряд считать
+болезнью. Проверка должна быть быстрой и дешёвой; не стоит ходить
+во внешние сервисы.
+
+\begin{notebox}
+HEALTHCHECK не перезапускает контейнер сам по себе. Он влияет на статус
+(\cmd{healthy}/\cmd{unhealthy}), а решения принимают Compose
+(\cmd{depends\_on: condition: service\_healthy}), Swarm или Kubernetes.
+\end{notebox}
+
+\subsection{Остальные инструкции}
+
+\begin{description}[style=nextline]
+  \item[LABEL] Метаданные образа: автор, версия, ссылка на репозиторий.
+        \cmd{org.opencontainers.\-image.\-version="1.0"}.
+  \item[VOLUME] Объявляет точку монтирования. Данные, записанные в неё
+        при сборке, теряются: том создаётся при запуске. Используйте
+        осознанно, предпочитая тома, создаваемые при запуске.
+  \item[STOPSIGNAL] Сигнал, который Docker посылает при остановке.
+        По умолчанию \cmd{SIGTERM}.
+  \item[SHELL] Меняет оболочку для shell-формы инструкций.
+        \cmd{SHELL ["/bin/bash", "-o", "pipefail", "-c"]}.
+  \item[ONBUILD] Откладывает инструкцию до сборки дочернего образа.
+        Встречается в старых базовых образах; в новом коде избегайте.
+\end{description}
+
+\section{Кэш слоёв}
+
+Docker кэширует каждый слой. Инструкция выполняется заново, если
+изменилась она сама, её аргументы или любой из предыдущих слоёв.
+Поэтому порядок инструкций определяет скорость сборки.
+
+\begin{code}[language=dockerfile]
+# Плохо: любое изменение кода сбрасывает установку зависимостей
+COPY . .
+RUN npm ci
+
+# Хорошо: сначала манифесты, потом код
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+\end{code}
+
+\begin{code}[language=bash]
+$ docker build -t app .
+[+] Building 1.2s (12/12) FINISHED
+ => [2/5] COPY package.json package-lock.json ./
+ => [3/5] RUN npm ci
+ => CACHED [4/5] COPY . .
+\end{code}
+
+Полезные приёмы:
+
+\begin{itemize}
+  \item \flag{--no-cache}~--- собрать всё заново (для проверки
+        воспроизводимости).
+  \item \flag{--progress=plain}~--- подробный вывод, удобно при отладке.
+  \item \flag{--pull}~--- обновить базовый образ перед сборкой.
+  \item \cmd{docker builder prune}~--- очистить кэш сборки.
+\end{itemize}
+
+\begin{tipbox}
+В CI кэш можно переносить между сборками через реестр:
+\cmd{docker buildx build --cache-from type=registry,ref=...}. Тогда
+зависимости не устанавливаются заново на каждом запуске.
+\end{tipbox}
+
+\section{.dockerignore}
+
+Файл \file{.dockerignore} исключает лишнее из контекста сборки. Он
+ускоряет сборку, уменьшает риск утечки секретов и предотвращает
+случайное копирование \cmd{node\_modules} или \file{.git}.
+
+\begin{code}
+.git
+.gitignore
+node_modules
+__pycache__
+*.pyc
+.env
+.env.*
+*.log
+dist
+coverage
+Dockerfile
+docker-compose*.yml
+README.md
+\end{code}
+
+\begin{warnbox}
+Без \file{.dockerignore} команда \cmd{COPY . .} скопирует в образ
+\file{.env} с паролями, историю Git и локальные артефакты. Секреты
+в образе остаются в слоях даже после удаления файла в следующей
+инструкции.
+\end{warnbox}
+
+\section{Многоэтапная сборка}
+
+Многоэтапная сборка (\emph{multi-stage build}) позволяет использовать
+тяжёлые инструменты на этапе компиляции и оставлять в финальном образе
+только результат.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  stage/.style={draw=accent!55!black, fill=accent!7, rounded corners=2pt,
+    minimum width=4.6cm, minimum height=1.5cm, align=left, inner sep=6pt},
+  final/.style={draw=good!60!black, fill=good!8, rounded corners=2pt,
+    minimum width=4.6cm, minimum height=1.5cm, align=left, inner sep=6pt},
+  arr/.style={-Latex, thick, accent!70},
+]
+  \node[stage] (build) at (0,0)
+    {\textbf{этап build}\\[2pt]\cmd{golang:1.25-alpine}\\компилятор, исходники\\\cmd{go build -o /out/app}};
+  \node[final, right=2.2cm of build] (final)
+    {\textbf{финальный этап}\\[2pt]\cmd{scratch}\\только бинарник\\\cmd{COPY --from=build}};
+  \draw[arr] (build) -- node[above, text=muted] {артефакт} (final);
+  \node[below=2pt of build, text=muted] {$\approx$ 850 МБ};
+  \node[below=2pt of final, text=muted] {$\approx$ 8 МБ};
+\end{tikzpicture}
+\caption{Многоэтапная сборка: инструменты остаются в первом этапе,
+в финальный образ попадает только результат}\label{fig:multistage}
+\end{figure}
+
+\begin{code}[language=dockerfile]
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/app
+
+FROM scratch
+COPY --from=build /out/app /app
+USER 10001
+ENTRYPOINT ["/app"]
+\end{code}
+
+\begin{code}[language=bash]
+$ docker build -t app:1.0 .
+$ docker image ls app
+REPOSITORY   TAG   IMAGE ID       CREATED         SIZE
+app          1.0   c3d4e5f6a7b8   3 seconds ago   8.1MB
+\end{code}
+
+Для Node.js и фронтенда финальным этапом часто служит nginx:
+
+\begin{code}[language=dockerfile]
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+\end{code}
+
+\begin{tipbox}
+Можно остановиться на промежуточном этапе и зайти в него:
+\cmd{docker build --target build -t app:build .}, затем
+\cmd{docker run --rm -it app:build sh}. Это удобно, когда сборка падает
+и нужно посмотреть, что получилось.
+\end{tipbox}
+
+\section{Возможности BuildKit}
+
+Современный Docker по умолчанию использует BuildKit~--- сборщик
+с расширенными возможностями. Некоторые из них особенно полезны.
+
+\subsection{Кэш пакетных менеджеров}
+
+\begin{code}[language=dockerfile]
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+\end{code}
+
+Кэш сохраняется между сборками и не попадает в образ.
+
+\subsection{Секреты при сборке}
+
+\begin{code}[language=dockerfile]
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
+    npm ci
+\end{code}
+
+\begin{code}[language=bash]
+$ docker build --secret id=npmrc,src=$HOME/.npmrc -t app .
+\end{code}
+
+Секрет доступен только на время выполнения инструкции и не остаётся
+в слоях.
+
+\subsection{Here-doc и COPY --link}
+
+\begin{code}[language=dockerfile]
+RUN <<EOF
+apt-get update
+apt-get install -y --no-install-recommends curl
+rm -rf /var/lib/apt/lists/*
+EOF
+
+COPY --link --chown=10001:10001 . /app
+\end{code}
+
+Here-doc избавляет от длинных цепочек \cmd{\&\&}, а \cmd{COPY --link}
+улучшает переиспользование слоёв при пересборке.
+
+\subsection{Мультиархитектурная сборка}
+
+\begin{code}[language=bash]
+$ docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    --tag registry.example.com/team/app:1.0 \
+    --push .
+\end{code}
+
+Результат~--- один тег, указывающий на образы для двух архитектур.
+Требуется драйвер \cmd{docker-container} или удалённый builder;
+локальные образы при \flag{--push} не загружаются автоматически.
+
+\section{Типичные ошибки}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}XX@{}}
+\toprule
+\textbf{Ошибка} & \textbf{Последствие} \\
+\midrule
+\cmd{COPY . .} до установки зависимостей & кэш сбрасывается при каждом
+изменении кода \\
+\cmd{apt-get update} без \cmd{install} в том же \cmd{RUN} & устаревший
+индекс пакетов, ошибки 404 \\
+секреты в \cmd{ARG} или \cmd{ENV} & утечка в историю образа \\
+\cmd{latest} в базовом образе & невоспроизводимые сборки \\
+запуск от \cmd{root} без необходимости & лишние права при компрометации \\
+установка компиляторов в финальный образ & образ в разы больше нужного \\
+\cmd{ADD} для локальных файлов & неявная распаковка и неожиданное
+поведение \\
+нет \file{.dockerignore} & гигабайты контекста и утечка \file{.env} \\
+shell-форма \cmd{CMD} & сигналы не доходят до приложения \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Dockerfile выполняется последовательно; каждая инструкция,
+        меняющая файлы, создаёт слой.
+  \item Сначала копируйте манифесты зависимостей, потом код~---
+        так работает кэш.
+  \item \cmd{CMD}~--- аргументы по умолчанию, \cmd{ENTRYPOINT}~---
+        исполняемый файл; используйте exec-форму.
+  \item \file{.dockerignore} обязателен; секреты не должны попадать
+        в контекст и в \cmd{ARG}.
+  \item Многоэтапная сборка оставляет в образе только результат,
+        а BuildKit даёт кэш, секреты и мультиархитектурные сборки.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Чем \cmd{COPY} отличается от \cmd{ADD} и что предпочтительнее?
+  \item Чем \cmd{ARG} отличается от \cmd{ENV}?
+  \item Почему \cmd{CMD ["python", "app.py"]} лучше \cmd{CMD python app.py}?
+  \item Почему зависимости устанавливают до копирования всего кода?
+  \item Что произойдёт с файлами, записанными в каталог, объявленный
+        \cmd{VOLUME}, во время сборки?
+  \item Зачем нужна многоэтапная сборка?
+  \item Как передать секрет в \cmd{RUN} и не оставить его в образе?
+\end{selfcheck}

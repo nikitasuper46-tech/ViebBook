@@ -1,0 +1,304 @@
+\chapter{Сети}
+
+Контейнеры редко живут поодиночке: приложению нужна база данных,
+кэш, очередь, внешние API. Docker создаёт для каждого контейнера
+отдельное сетевое пространство имён и умеет соединять их в виртуальные
+сети. В этой главе~--- драйверы сетей, публикация портов, разрешение
+имён и диагностика типичных проблем.
+
+\section{Как выглядит сеть контейнера}
+
+У каждого контейнера свой сетевой интерфейс, своя таблица маршрутизации
+и свой \cmd{localhost}. По умолчанию Docker подключает контейнер
+к сети \cmd{bridge}, созданной на хосте. Контейнер получает внутренний
+IP-адрес и может выходить в интернет через NAT, но снаружи недоступен,
+пока порт не опубликован.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  cont/.style={draw=good!60!black, fill=good!8, rounded corners=2pt,
+    minimum width=2.9cm, minimum height=0.95cm, align=center},
+  bridge/.style={draw=accent!60!black, fill=accent!8, rounded corners=2pt,
+    minimum width=3.6cm, minimum height=0.8cm, align=center},
+  ext/.style={draw=warm!65!black, fill=warm!8, rounded corners=2pt,
+    minimum width=2.4cm, minimum height=0.9cm, align=center},
+  arr/.style={-Latex, thick, accent!70},
+]
+  \draw[draw=accent!40, fill=accent!3, rounded corners=4pt] (1.2,0.2) rectangle (12.4,5.1);
+  \node[anchor=north west, text=accent!70!black] at (1.35,5.0) {хост Linux};
+  \node[bridge] (br) at (6.8,3.9) {docker0 \textbullet\ 172.17.0.1/16};
+  \node[cont] (web) at (4.5,1.3) {web\\172.17.0.2};
+  \node[cont] (db) at (9.1,1.3) {db\\172.17.0.3};
+  \draw[arr] (web.north) -- node[left, text=muted] {veth} (br.south -| web.north);
+  \draw[arr] (db.north) -- node[right, text=muted] {veth} (br.south -| db.north);
+
+  \node[ext] (user) at (0,1.3) {браузер};
+  \draw[arr, warm] (user.east) -- node[above, text=warm] {localhost:8080} (web.west);
+  \node[below=1pt of user, text=muted, align=center] {публикация\\8080$\rightarrow$80};
+\end{tikzpicture}
+\caption{Сеть bridge: контейнеры соединены виртуальным мостом,
+а опубликованный порт пробрасывает трафик с хоста в контейнер}
+\label{fig:bridge}
+\end{figure}
+
+Внутри контейнера \cmd{localhost}~--- это сам контейнер. Чтобы
+обратиться к соседу, используется имя контейнера (в пользовательской
+сети) или IP-адрес. Чтобы обратиться к сервису на хосте, нужен
+адрес хоста, а не \cmd{localhost}.
+
+\section{Драйверы сетей}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+\textbf{Драйвер} & \textbf{Что делает} & \textbf{Когда использовать} \\
+\midrule
+\cmd{bridge} & виртуальный мост на хосте, NAT & по умолчанию; локальная
+разработка и большинство одиночных хостов \\
+\cmd{host} & контейнер использует сеть хоста без изоляции & максимальная
+производительность, но порты конфликтуют \\
+\cmd{none} & только loopback, без внешней сети & изоляция, пакетная
+обработка, свои сетевые настройки \\
+\cmd{overlay} & сеть поверх нескольких хостов (VXLAN) & Swarm и
+оркестраторы \\
+\cmd{macvlan} & контейнер получает MAC-адрес в физической сети &
+legacy-приложения, которым нужен L2-доступ \\
+\cmd{ipvlan} & как macvlan, но на уровне L3 & высокая плотность
+контейнеров \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+В этой книге используются \cmd{bridge}, \cmd{host} и \cmd{none};
+остальные драйверы нужны в кластерах и специальных сценариях.
+
+\section{Сеть по умолчанию и пользовательские сети}
+
+У сети \cmd{bridge}, которую Docker создаёт автоматически, есть важный
+недостаток: в ней нет автоматического разрешения имён между
+контейнерами. Контейнеры могут общаться по IP, но не по имени.
+Устаревший механизм \flag{--link} решал это частично и сейчас
+не рекомендуется.
+
+\begin{defbox}
+\textbf{Пользовательская сеть} (\emph{user-defined bridge})~---
+сеть, созданная командой \cmd{docker network create}. В ней работает
+встроенный DNS: контейнеры находят друг друга по именам и сетевым
+алиасам.
+\end{defbox}
+
+\begin{code}[language=bash]
+$ docker network create appnet
+$ docker network ls
+NETWORK ID     NAME      DRIVER    SCOPE
+0f1e2d3c4b5a   appnet    bridge    local
+8a7b6c5d4e3f   bridge    bridge    local
+...
+
+$ docker network inspect appnet --format '{{json .IPAM.Config}}'
+[{"Subnet":"172.18.0.0/16","Gateway":"172.18.0.1"}]
+\end{code}
+
+\begin{tipbox}
+Создавайте отдельную пользовательскую сеть для каждого проекта.
+Это даёт DNS по именам, изоляцию от чужих контейнеров и предсказуемые
+имена в конфигурации.
+\end{tipbox}
+
+\section{Публикация портов}
+
+Публикация связывает порт хоста с портом контейнера.
+
+\begin{code}[language=bash]
+$ docker run -d --name web -p 8080:80 nginx:1.27-alpine
+$ docker run -d --name api -p 127.0.0.1:3000:3000 api:1.0
+$ docker run -d --name dns -p 5353:53/udp coredns/coredns
+$ docker run -d -P --name many nginx:1.27-alpine   # все EXPOSE на случайные порты
+$ docker port web
+80/tcp -> 0.0.0.0:8080
+\end{code}
+
+\begin{itemize}
+  \item \flag{-p 8080:80}~--- порт 8080 на всех интерфейсах хоста.
+  \item \flag{-p 127.0.0.1:8080:80}~--- только локально; снаружи
+        недоступен.
+  \item \flag{-p 8080:80/udp}~--- протокол UDP (по умолчанию TCP).
+  \item \flag{-P}~--- опубликовать все порты из \cmd{EXPOSE}
+        на случайные порты хоста.
+\end{itemize}
+
+\begin{warnbox}
+\cmd{EXPOSE} в Dockerfile ничего не публикует: это документация.
+Порт открывается только флагом \flag{-p} (или \cmd{ports}
+в Compose). Не публикуйте базы данных на \cmd{0.0.0.0}: если порт
+не нужен снаружи, привяжите его к \cmd{127.0.0.1}.
+\end{warnbox}
+
+\begin{notebox}
+В Linux публикация портов реализуется правилами NAT (iptables
+или nftables) и, для некоторых случаев, процессом
+\cmd{docker-proxy}. Поэтому порт, занятый другим процессом,
+вызывает ошибку \cmd{port is already allocated}, а изменения
+в firewall хоста могут влиять на доступность контейнеров.
+\end{notebox}
+
+\section{Практика: два контейнера в одной сети}
+
+Соединим веб-сервер и клиент, проверив DNS по имени.
+
+\begin{code}[language=bash]
+$ docker network create appnet
+
+$ docker run -d --name web --network appnet nginx:1.27-alpine
+
+$ docker run --rm --network appnet curlimages/curl \
+    -s -o /dev/null -w '%{http_code}\n' http://web
+200
+\end{code}
+
+Клиент обратился по имени \cmd{web}, и Docker разрешил его в IP
+контейнера. То же самое работает с базой данных:
+
+\begin{code}[language=bash]
+$ docker run -d --name db --network appnet \
+    -e POSTGRES_PASSWORD=secret postgres:17
+
+$ docker run --rm --network appnet postgres:17 \
+    psql -h db -U postgres -c 'SELECT 1;'
+ ?column?
+----------
+        1
+\end{code}
+
+Подключение и отключение существующего контейнера:
+
+\begin{code}[language=bash]
+$ docker network connect appnet web2
+$ docker network disconnect appnet web2
+$ docker network connect --alias api appnet api
+\end{code}
+
+\section{Диагностика сети}
+
+Начните с того, что видит Docker.
+
+\begin{code}[language=bash]
+$ docker network inspect appnet
+$ docker inspect web --format '{{json .NetworkSettings.Networks}}'
+$ docker port web
+$ docker exec web cat /etc/resolv.conf
+nameserver 127.0.0.11
+\end{code}
+
+Адрес \cmd{127.0.0.11}~--- встроенный DNS Docker. Если имя не
+разрешается, проверьте, что оба контейнера находятся в одной
+пользовательской сети, а не в сети \cmd{bridge} по умолчанию.
+
+Дальше~--- изнутри контейнера:
+
+\begin{code}[language=bash]
+$ docker exec web getent hosts db
+172.18.0.3      db
+$ docker exec web ping -c 1 db
+$ docker exec web curl -sS http://db:5432 || true
+\end{code}
+
+\begin{notebox}
+В минимальных образах может не быть \cmd{ping}, \cmd{curl},
+\cmd{getent} и даже \cmd{sh}. Для диагностики запустите временный
+контейнер в той же сети:
+\cmd{docker run --rm -it --network appnet nicolaka/netshoot}.
+\end{notebox}
+
+Частые причины проблем:
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}XX@{}}
+\toprule
+\textbf{Симптом} & \textbf{Причина и решение} \\
+\midrule
+\cmd{port is already allocated} & порт занят; смените порт хоста
+или остановите конфликтующий процесс \\
+имя не разрешается & контейнеры в разных сетях или используется
+сеть \cmd{bridge} по умолчанию; создайте пользовательскую сеть \\
+\cmd{connection refused} & сервис слушает \cmd{127.0.0.1} вместо
+\cmd{0.0.0.0} либо ещё не готов \\
+\cmd{connection timed out} &firewall или маршрутизация; проверьте
+\cmd{iptables -L}, \cmd{nft list ruleset} и подсеть \\
+доступ снаружи есть, с хоста нет & сервис привязан к другому
+интерфейсу или порт публикуется только на \cmd{127.0.0.1} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Особые режимы}
+
+\subsection{Сеть хоста}
+
+\cmd{--network host} отключает сетевую изоляцию: приложение слушает
+порты хоста напрямую. Флаг \flag{-p} при этом игнорируется.
+
+\begin{code}[language=bash]
+$ docker run --rm --network host nginx:1.27-alpine
+\end{code}
+
+Плюс~--- нет накладных расходов NAT, минус~--- конфликты портов
+и меньшая изоляция. В Docker Desktop режим host относится к виртуальной
+машине, а не к вашей macOS или Windows.
+
+\subsection{Без сети}
+
+\cmd{--network none} оставляет только loopback. Полезно для задач
+обработки данных, где сеть не нужна, и для повышения безопасности.
+
+\subsection{Доступ к хосту из контейнера}
+
+На Linux адрес хоста доступен через шлюз сети или
+\cmd{host-gateway}:
+
+\begin{code}[language=bash]
+$ docker run --rm --add-host=host.docker.internal:host-gateway \
+    curlimages/curl -s http://host.docker.internal:8080
+\end{code}
+
+В Docker Desktop имя \cmd{host.docker.internal} доступно из коробки.
+Не используйте \cmd{localhost} для доступа к сервису на хосте:
+внутри контейнера это он сам.
+
+\subsection{Overlay и macvlan}
+
+\cmd{overlay} нужен, когда контейнеры находятся на разных машинах:
+сеть работает поверх VXLAN и требует кластера (Swarm или другого
+оркестратора). \cmd{macvlan} выдаёт контейнеру адрес в физической
+сети~--- удобно для старых приложений, которые ждут широковещательный
+трафик, но требует настройки коммутатора и осторожности.
+
+\begin{summarybox}
+\begin{itemize}
+  \item У контейнера своя сеть: свой \cmd{localhost}, свои порты.
+  \item По умолчанию используется bridge; в пользовательской сети
+        работает DNS по именам контейнеров.
+  \item \cmd{EXPOSE} документирует, \flag{-p} публикует.
+  \item Для диагностики смотрите \cmd{docker network inspect},
+        \file{/etc/resolv.conf} и запускайте временный контейнер
+        в той же сети.
+  \item \cmd{host} и \cmd{none}~--- специальные режимы с другими
+        компромиссами.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Почему в сети \cmd{bridge} по умолчанию не работают имена
+        контейнеров?
+  \item Чем \flag{-p 8080:80} отличается от \cmd{EXPOSE 80}?
+  \item Как привязать опубликованный порт только к localhost?
+  \item Что видит контейнер по адресу \cmd{localhost}?
+  \item Как обратиться к сервису на хосте из контейнера в Linux?
+  \item Почему приложение должно слушать \cmd{0.0.0.0}, а не
+        \cmd{127.0.0.1}, чтобы быть доступным через \flag{-p}?
+\end{selfcheck}

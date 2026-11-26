@@ -1,0 +1,496 @@
+\chapter{Docker Compose}
+
+Одиночный контейнер удобен для экспериментов, но реальное приложение
+состоит из нескольких сервисов: веб-сервер, API, база, кэш. Запускать
+их длинными командами \cmd{docker run} неудобно и опасно: легко забыть
+том, сеть или переменную. Docker Compose описывает всё приложение
+в одном YAML-файле и управляет им одной командой.
+
+\section{Зачем нужен Compose}
+
+\begin{itemize}
+  \item \textbf{Декларативность.} Вы описываете желаемое состояние:
+        какие сервисы, образы, порты, тома и сети нужны.
+  \item \textbf{Воспроизводимость.} Файл лежит в репозитории рядом
+        с кодом; коллеге достаточно выполнить \cmd{docker compose up}.
+  \item \textbf{Единая сеть и имена.} Compose создаёт сеть проекта,
+        в которой сервисы доступны по именам.
+  \item \textbf{Управление жизненным циклом.} Запуск, остановка,
+        пересборка, просмотр логов и выполнение команд~--- без
+        запоминания идентификаторов контейнеров.
+\end{itemize}
+
+\begin{defbox}
+\textbf{Проект Compose}~--- набор контейнеров, сетей и томов,
+объединённых общим именем (по умолчанию~--- именем каталога).
+Все ресурсы проекта помечаются метками, поэтому Compose не трогает
+чужие контейнеры.
+\end{defbox}
+
+\section{Установка и проверка}
+
+В современных версиях Docker Compose~--- это плагин CLI, а не отдельный
+бинарник \cmd{docker-compose}.
+
+\begin{code}[language=bash]
+$ docker compose version
+Docker Compose version v2.32.1
+\end{code}
+
+Если команда не найдена, установите пакет
+\cmd{docker-compose-plugin} (раздел~3.2) или отдельный плагин Compose.
+Старые скрипты с \cmd{docker-compose} (через дефис) лучше переписать
+на \cmd{docker compose}.
+
+\section{Первый файл}
+
+Создадим каталог проекта и файл \file{compose.yaml}.
+
+\begin{code}[language=composeyaml]
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+
+  cache:
+    image: redis:7-alpine
+\end{code}
+
+\begin{code}[language=bash]
+$ docker compose up -d
+[+] Running 3/3
+ Network demo_default    Created
+ Container demo-cache-1  Started
+ Container demo-web-1    Started
+$ docker compose ps
+NAME           IMAGE               COMMAND                  SERVICE   STATUS    PORTS
+demo-cache-1   redis:7-alpine      "docker-entrypoint.s…"   cache     Up
+demo-web-1     nginx:1.27-alpine   "/docker-entrypoint.…"   web       Up        0.0.0.0:8080->80/tcp
+$ curl -I http://localhost:8080
+HTTP/1.1 200 OK
+\end{code}
+
+Остановка и удаление:
+
+\begin{code}[language=bash]
+$ docker compose stop          # остановить, сохранить контейнеры
+$ docker compose start         # запустить снова
+$ docker compose down          # удалить контейнеры и сеть
+$ docker compose down -v       # ещё и тома проекта
+\end{code}
+
+\begin{warnbox}
+\cmd{docker compose down -v} удаляет именованные тома проекта вместе
+с данными. Это удобно для сброса стенда, но катастрофично, если
+в томе лежит база, которую вы не забэкапили. Перед выполнением
+проверьте \cmd{docker compose config --volumes}.
+\end{warnbox}
+
+\section{Структура файла}
+
+Файл Compose состоит из нескольких разделов верхнего уровня.
+
+\begin{code}[language=composeyaml]
+name: demo                # имя проекта
+
+services:                 # контейнеры
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+
+volumes:                  # именованные тома
+  pgdata:
+
+networks:                 # сети
+  appnet:
+    driver: bridge
+\end{code}
+
+\begin{itemize}
+  \item \cmd{name} задаёт имя проекта; без него используется имя
+        каталога.
+  \item \cmd{services}~--- обязательный раздел: описание контейнеров.
+  \item \cmd{volumes} и \cmd{networks}~--- объявления ресурсов,
+        на которые ссылаются сервисы.
+  \item Ключ \cmd{version} в Compose~v2 не нужен и считается устаревшим.
+\end{itemize}
+
+\section{Описание сервиса}
+
+\begin{code}[language=composeyaml]
+services:
+  api:
+    image: shop-api:1.4.2          # или build
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      args:
+        APP_VERSION: "1.4.2"
+    container_name: shop-api       # необязательно, мешает масштабированию
+    command: ["python", "app.py", "--port", "8000"]
+    environment:
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://app:${DB_PASSWORD}@db:5432/app
+    env_file:
+      - ./api/.env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./uploads:/app/uploads
+    networks:
+      - appnet
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    profiles: ["core"]
+\end{code}
+
+\subsection{image и build}
+
+Если указан \cmd{build}, Compose собирает образ локально. Если ещё
+и \cmd{image}, собранный образ получает это имя. При
+\cmd{docker compose up --build} образы пересобираются; без флага
+используется существующий образ, если он есть.
+
+\subsection{ports и expose}
+
+\cmd{ports} публикует порты на хосте, \cmd{expose} делает их
+доступными только внутри сети проекта. Синтаксис \cmd{ports} совпадает
+с \flag{-p}:
+
+\begin{code}[language=composeyaml]
+    ports:
+      - "8080:80"
+      - "127.0.0.1:8443:443"
+      - "5353:53/udp"
+\end{code}
+
+\subsection{environment, env\_file и подстановки}
+
+\cmd{environment} задаёт переменные напрямую, \cmd{env\_file} читает
+их из файла. В значениях работает подстановка переменных окружения
+хоста и файла \file{.env}.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Синтаксис} & \textbf{Значение} \\
+\midrule
+\cmd{\$\{VAR\}} & значение переменной; пустая строка, если не задана \\
+\cmd{\$\{VAR:-default\}} & значение или значение по умолчанию \\
+\cmd{\$\{VAR:?message\}} & ошибка с сообщением, если переменная не задана \\
+\cmd{\$\$} & литеральный символ \cmd{\$} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{code}
+# .env
+DB_PASSWORD=super-secret
+APP_VERSION=1.4.2
+\end{code}
+
+\begin{code}[language=composeyaml]
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+\end{code}
+
+\begin{tipbox}
+Проверяйте итоговую конфигурацию командой
+\cmd{docker compose config}: она подставляет переменные, раскрывает
+файлы и показывает, что именно будет запущено. Секреты при этом
+попадут в вывод~--- не публикуйте его в CI-логах.
+\end{tipbox}
+
+\subsection{depends\_on и здоровье сервисов}
+
+Короткая форма \cmd{depends\_on: [db]} задаёт только порядок запуска,
+но не ждёт готовности базы. Длинная форма с условием ждёт успешной
+проверки здоровья.
+
+\begin{code}[language=composeyaml]
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+\end{code}
+
+\begin{warnbox}
+Даже \cmd{condition: service\_healthy} не гарантирует, что база
+готова принимать конкретную схему. Приложение должно уметь
+переподключаться и повторять запросы. Healthcheck~--- вспомогательный
+сигнал, а не замена устойчивости кода.
+\end{warnbox}
+
+\subsection{restart, resources и прочее}
+
+\begin{code}[language=composeyaml]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+\end{code}
+
+Раздел \cmd{deploy} в Compose применяется частично: ограничения
+ресурсов работают, а параметры вроде \cmd{replicas} имеют смысл
+только в Swarm. Для обычного \cmd{docker compose up} используйте
+\cmd{cpus} и \cmd{memory} в \cmd{deploy.resources.limits}~---
+они поддерживаются.
+
+\section{Полный пример}
+
+Соберём приложение из API и PostgreSQL с томом, проверкой здоровья
+и пользовательской сетью.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  svc/.style={draw=accent!55!black, fill=accent!7, rounded corners=2pt,
+    minimum width=2.7cm, minimum height=1.0cm, align=center},
+  ext/.style={draw=warm!65!black, fill=warm!8, rounded corners=2pt,
+    minimum width=2.2cm, minimum height=0.9cm, align=center},
+  vol/.style={draw=good!60!black, fill=good!8, cylinder, shape border rotate=90,
+    aspect=0.25, minimum height=1.0cm, minimum width=2.3cm, align=center},
+  arr/.style={-Latex, thick, accent!70},
+]
+  \node[ext, minimum width=1.9cm] (client) at (-1.4,0) {браузер};
+  \node[svc, minimum width=2.6cm] (web) at (2.0,0) {web\\nginx:80};
+  \node[svc, minimum width=2.6cm] (api) at (6.3,0) {api\\:8000};
+  \node[svc, minimum width=2.6cm] (db) at (10.6,0) {db\\postgres:5432};
+  \node[vol] (pg) at (10.6,-1.9) {pgdata};
+
+  \draw[arr] (client) -- node[above, text=muted] {8080} (web);
+  \draw[arr] (web) -- node[above, text=muted] {api:8000} (api);
+  \draw[arr] (api) -- node[above, text=muted] {db:5432} (api -| db.west);
+  \draw[arr] (db) -- (pg);
+
+  \draw[dashed, accent2!70, rounded corners=6pt] (0.5,-2.7) rectangle (13.1,1.0);
+  \node[anchor=south west, text=accent2!80!black] at (0.55,1.02) {сеть appnet};
+\end{tikzpicture}
+\caption{Приложение Compose: браузер обращается к web, web~--- к api
+по имени сервиса, api~--- к базе; данные базы хранятся в томе}
+\label{fig:compose}
+\end{figure}
+
+\begin{code}[language=composeyaml]
+name: shop
+
+services:
+  api:
+    build: ./api
+    image: shop-api:1.4.2
+    environment:
+      DATABASE_URL: postgres://app:${DB_PASSWORD}@db:5432/app
+      LOG_LEVEL: info
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks: [appnet]
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [appnet]
+
+volumes:
+  pgdata:
+
+networks:
+  appnet:
+    driver: bridge
+\end{code}
+
+Запуск:
+
+\begin{code}[language=bash]
+$ export DB_PASSWORD=secret
+$ docker compose up -d --build
+$ docker compose ps
+$ docker compose logs -f api
+$ docker compose exec db psql -U app -d app -c 'SELECT 1;'
+$ docker compose down
+\end{code}
+
+\begin{notebox}
+Пароль через переменную окружения~--- компромисс для учебного примера.
+В production используйте менеджер секретов (Vault, AWS Secrets Manager,
+Docker secrets в Swarm, внешние CSI-драйверы в Kubernetes) и не храните
+\file{.env} с паролями в репозитории.
+\end{notebox}
+
+\section{Команды Compose}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Команда} & \textbf{Назначение} \\
+\midrule
+\cmd{up -d} & создать и запустить сервисы в фоне \\
+\cmd{up --build} & пересобрать образы перед запуском \\
+\cmd{ps} & состояние контейнеров проекта \\
+\cmd{logs -f SERVICE} & логи сервиса в реальном времени \\
+\cmd{exec SERVICE CMD} & выполнить команду в работающем контейнере \\
+\cmd{run --rm SERVICE CMD} & разовый контейнер (миграции, тесты) \\
+\cmd{stop} / \cmd{start} / \cmd{restart} & управление без удаления \\
+\cmd{down} & удалить контейнеры и сеть проекта \\
+\cmd{down -v} & дополнительно удалить тома \\
+\cmd{config} & проверить и показать итоговый YAML \\
+\cmd{build} & собрать образы \\
+\cmd{pull} & скачать образы \\
+\cmd{push} & отправить образы в реестр \\
+\cmd{watch} & синхронизировать файлы и пересобирать \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section{Проекты, профили и переопределения}
+
+\subsection{Имя проекта и несколько файлов}
+
+Имя проекта задаётся ключом \cmd{name}, флагом \flag{-p} или
+переменной \envvar{COMPOSE\_PROJECT\_NAME}. Оно влияет на имена
+контейнеров, сетей и томов.
+
+\begin{code}[language=bash]
+$ docker compose -p staging up -d
+$ docker compose -f compose.yaml -f compose.prod.yaml up -d
+\end{code}
+
+Файл \file{compose.override.yaml} подхватывается автоматически. Это
+удобно для локальной разработки: основной файл описывает production,
+а override добавляет привязку каталога с кодом и отладочные порты.
+
+\begin{code}[language=composeyaml]
+# compose.override.yaml
+services:
+  api:
+    volumes:
+      - ./api:/app
+    environment:
+      LOG_LEVEL: debug
+\end{code}
+
+\subsection{Профили}
+
+Профили позволяют держать в одном файле необязательные сервисы:
+админку, отладчик, тестовые зависимости.
+
+\begin{code}[language=composeyaml]
+services:
+  adminer:
+    image: adminer:4
+    profiles: ["tools"]
+    ports:
+      - "127.0.0.1:8081:8080"
+\end{code}
+
+\begin{code}[language=bash]
+$ docker compose up -d                    # adminer не запустится
+$ docker compose --profile tools up -d    # запустится
+$ docker compose --profile tools ps
+\end{code}
+
+\subsection{Режим разработки}
+
+Compose умеет следить за файлами и синхронизировать их в контейнер
+или пересобирать образ.
+
+\begin{code}[language=composeyaml]
+services:
+  api:
+    build: ./api
+    develop:
+      watch:
+        - action: sync
+          path: ./api/src
+          target: /app/src
+        - action: rebuild
+          path: ./api/requirements.txt
+\end{code}
+
+\begin{code}[language=bash]
+$ docker compose watch
+\end{code}
+
+\begin{tipbox}
+Для горячей перезагрузки Node.js и Python обычно достаточно привязки
+каталога с кодом (\cmd{./api:/app}) и переменной окружения, включающей
+режим разработки. \cmd{watch} удобнее тем, что не требует правки
+compose-файла под каждую ОС и умеет пересобирать образ при изменении
+зависимостей.
+\end{tipbox}
+
+\section{Когда Compose уже мало}
+
+Compose рассчитан на один хост. Он не умеет:
+
+\begin{itemize}
+  \item запускать контейнеры на нескольких машинах;
+  \item автоматически заменять упавший узел;
+  \item балансировать нагрузку между экземплярами сервиса;
+  \item выполнять постепенные обновления без простоя на кластере.
+\end{itemize}
+
+Когда приложение перерастает один сервер, на смену приходят
+оркестраторы: Docker Swarm (проще, встроен в Docker) или Kubernetes
+(стандарт де-факто). Знания Compose при этом не пропадают: структура
+сервисов, переменные, тома и сети переносятся почти один в один.
+
+\begin{summarybox}
+\begin{itemize}
+  \item Compose описывает многоконтейнерное приложение в
+        \file{compose.yaml}.
+  \item Проект объединяет сервисы, сети и тома под общим именем.
+  \item В сети проекта сервисы доступны по именам; порты публикуются
+        только там, где это нужно.
+  \item \cmd{depends\_on} с \cmd{service\_healthy} ждёт готовности,
+        но приложение всё равно должно быть устойчивым к переподключению.
+  \item Профили и override-файлы позволяют держать в одном проекте
+        разные сценарии запуска.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Чем \cmd{docker compose up} отличается от набора \cmd{docker run}?
+  \item Как в Compose обратиться к базе из другого сервиса?
+  \item Чем \cmd{ports} отличается от \cmd{expose}?
+  \item Зачем нужна длинная форма \cmd{depends\_on}?
+  \item Что удаляет \cmd{docker compose down -v}?
+  \item Как запустить сервис, помеченный профилем \cmd{tools}?
+\end{selfcheck}

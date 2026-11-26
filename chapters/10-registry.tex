@@ -1,0 +1,324 @@
+\chapter{Реестры и доставка образов}
+
+Собранный образ нужно доставить туда, где он будет работать:
+на другой компьютер, в тестовый стенд, в production. Для этого служат
+реестры~--- хранилища образов с версионированием и контролем доступа.
+В главе~--- публикация, теги, мультиархитектурные сборки, собственный
+реестр и автоматизация в CI.
+
+\section{Что такое реестр}
+
+\begin{defbox}
+\textbf{Реестр} (\emph{registry})~--- сервис, хранящий образы и
+предоставляющий API для их загрузки и выгрузки. Реестр хранит слои
+по digest, поэтому одинаковые слои не дублируются.
+\end{defbox}
+
+Популярные реестры:
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Реестр} & \textbf{Особенности} \\
+\midrule
+Docker Hub & публичный по умолчанию, огромная библиотека официальных
+образов, лимиты на анонимные загрузки \\
+GitHub Container Registry (GHCR) & удобен для проектов на GitHub,
+токен \cmd{GITHUB\_TOKEN} \\
+GitLab Container Registry & встроен в GitLab, права наследуются
+из проекта \\
+Amazon ECR, Google Artifact Registry, Azure ACR & облачные реестры
+с интеграцией IAM \\
+Harbor & self-hosted, сканирование, политики, репликация \\
+registry:2 & минимальный эталонный реестр для собственных нужд \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+С точки зрения Docker все реестры выглядят одинаково: имя образа
+начинается с домена реестра, а команды \cmd{pull} и \cmd{push}
+работают по одному протоколу.
+
+\section{Аутентификация}
+
+Публичные образы можно скачивать без входа. Для публикации и для
+приватных образов нужна аутентификация.
+
+\begin{code}[language=bash]
+$ docker login
+Login with your Docker ID to push and pull images from Docker Hub.
+Username: acme
+Password:
+Login Succeeded
+
+$ docker login ghcr.io -u acme
+$ docker logout
+\end{code}
+
+\begin{tipbox}
+В CI используйте токены и флаг \flag{--password-stdin}:
+\cmd{printf '\%s' "\$TOKEN" | docker login ghcr.io -u USER --password-stdin}.
+Так пароль не попадает в историю команд и списки процессов.
+\end{tipbox}
+
+Учётные данные сохраняются в \file{\textasciitilde/.docker/config.json},
+обычно через credential helper (например, \cmd{pass} или
+\cmd{secretservice}). Если helper не настроен, пароль может лежать
+в файле в base64~--- это не шифрование.
+
+\begin{warnbox}
+Не публикуйте \file{\textasciitilde/.docker/config.json} и не передавайте
+его в контейнеры. Для CI создавайте отдельные токены с минимальными
+правами и отзывайте их после использования.
+\end{warnbox}
+
+\section{Имена, теги и стратегии версионирования}
+
+При публикации имя образа должно содержать домен реестра и пространство
+имён:
+
+\begin{code}[language=bash]
+$ docker tag demo-api:1.0 ghcr.io/acme/demo-api:1.0
+$ docker push ghcr.io/acme/demo-api:1.0
+\end{code}
+
+Один образ можно отметить несколькими тегами. Разумная стратегия:
+
+\begin{itemize}
+  \item \textbf{неизменяемая версия}~--- \cmd{1.4.2} (semver) или
+        \cmd{sha-3f2a1c7} (короткий хеш коммита);
+  \item \textbf{скользящая минорная}~--- \cmd{1.4} (обновляется
+        с патчами);
+  \item \textbf{среда}~--- \cmd{staging}, \cmd{production} (указывает
+        на конкретную сборку, но подвижна);
+  \item \cmd{latest}~--- только для удобства разработки, не для
+        production.
+\end{itemize}
+
+\begin{code}[language=bash]
+$ SHA=$(git rev-parse --short HEAD)
+$ docker build -t ghcr.io/acme/demo-api:$SHA -t ghcr.io/acme/demo-api:1.4.2 .
+$ docker push ghcr.io/acme/demo-api:$SHA
+$ docker push ghcr.io/acme/demo-api:1.4.2
+$ docker push --all-tags ghcr.io/acme/demo-api
+\end{code}
+
+\begin{notebox}
+Многие реестры поддерживают неизменяемые теги (tag immutability):
+попытка перезаписать тег отклоняется. Если такой возможности нет,
+фиксируйте digest в манифестах развёртывания~--- это единственная
+по-настоящему неизменяемая ссылка.
+\end{notebox}
+
+\section{Мультиархитектурные образы}
+
+Ноутбуки на ARM и серверы на x86 требуют разных сборок. BuildKit
+позволяет собрать и опубликовать один тег, указывающий на несколько
+платформ.
+
+\begin{code}[language=bash]
+$ docker buildx create --name multi --use --driver docker-container
+$ docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    --tag ghcr.io/acme/demo-api:1.4.2 \
+    --push .
+$ docker buildx imagetools inspect ghcr.io/acme/demo-api:1.4.2
+Manifests:
+  Platform: linux/amd64
+  Platform: linux/arm64
+\end{code}
+
+\begin{warnbox}
+Мультиплатформенный результат нельзя загрузить в локальный Docker
+флагом \flag{--load}: локальное хранилище поддерживает только одну
+платформу. Публикуйте через \flag{--push} или собирайте под свою
+платформу отдельно.
+\end{warnbox}
+
+\begin{tipbox}
+Для сборки под чужую архитектуру на своей машине Docker использует
+эмуляцию QEMU. Она подходит для проверки, но сборка может быть
+в разы медленнее, а некоторые программы ведут себя иначе. В CI
+используйте отдельные runner'ы под каждую платформу.
+\end{tipbox}
+
+\section{Собственный реестр}
+
+Для локальной сети или закрытого контура можно поднять реестр
+за пару минут.
+
+\begin{code}[language=bash]
+$ docker run -d --name registry -p 5000:5000 \
+    -v registry-data:/var/lib/registry \
+    --restart unless-stopped \
+    registry:2
+
+$ docker tag demo-api:1.0 localhost:5000/demo-api:1.0
+$ docker push localhost:5000/demo-api:1.0
+$ curl -s http://localhost:5000/v2/_catalog
+{"repositories":["demo-api"]}
+\end{code}
+
+Для доступа с других машин по HTTP (без TLS) реестр нужно объявить
+небезопасным в \file{/etc/docker/daemon.json} на каждой машине:
+
+\begin{code}[language=bash]
+{
+  "insecure-registries": ["registry.local:5000"]
+}
+\end{code}
+
+\begin{warnbox}
+Небезопасный реестр допустим только в изолированной тестовой сети.
+В production используйте TLS и аутентификацию. Готовые решения~---
+Harbor, GitLab Registry, облачные реестры~--- уже содержат HTTPS,
+разграничение прав и сканирование уязвимостей.
+\end{warnbox}
+
+Базовая аутентификация через \cmd{htpasswd}:
+
+\begin{code}[language=bash]
+$ mkdir -p auth
+$ docker run --rm --entrypoint htpasswd httpd:2 \
+    -Bbn acme secret > auth/htpasswd
+
+$ docker run -d --name registry -p 5000:5000 \
+    -v "$(pwd)/auth:/auth" \
+    -e REGISTRY_AUTH=htpasswd \
+    -e REGISTRY_AUTH_HTPASSWD_REALM="Registry Realm" \
+    -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+    registry:2
+\end{code}
+
+\section{Публикация из CI}
+
+Типичный конвейер: собрать образ, прогнать тесты, опубликовать тег,
+зафиксировать digest. Пример для GitHub Actions:
+
+\begin{code}[language=composeyaml]
+name: build-and-push
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+\end{code}
+
+\begin{itemize}
+  \item \cmd{setup-buildx} включает BuildKit и кэш;
+  \item \cmd{login-action} безопасно передаёт токен;
+  \item \cmd{metadata-action} формирует теги из git-тега и хеша коммита;
+  \item \cmd{build-push-action} собирает и публикует образ,
+        используя кэш GitHub Actions.
+\end{itemize}
+
+\begin{tipbox}
+Собирайте образ ровно один раз и продвигайте его между средами
+по digest, а не пересобирайте на каждом этапе. Иначе тесты
+и production могут получить разные артефакты из одного коммита.
+\end{tipbox}
+
+\section{Доверие к образам}
+
+Публикация~--- не конец пути. Нужно понимать, что именно вы запускаете.
+
+\begin{itemize}
+  \item \textbf{Сканирование уязвимостей.} \cmd{docker scout cves IMAGE},
+        \cmd{trivy image IMAGE}, встроенные сканеры Harbor и облачных
+        реестров.
+  \item \textbf{SBOM.} Список компонентов образа:
+        \cmd{docker buildx build --sbom=true --push ...} или
+        \cmd{syft IMAGE}.
+  \item \textbf{Provenance.} Сведения о том, как и из чего собран образ:
+        \cmd{--provenance=true}.
+  \item \textbf{Подпись.} \cmd{cosign sign IMAGE}, проверка
+        \cmd{cosign verify IMAGE}; политика допускает только подписанные
+        образы.
+  \item \textbf{Pinning.} Фиксация базовых образов по digest:
+        \cmd{FROM node:22-alpine@sha256:...}.
+\end{itemize}
+
+\begin{warnbox}
+Тег \cmd{nginx:1.27-alpine} может указывать на разные digest в разные
+дни: сопровождающие пересобирают образ с обновлениями безопасности.
+Это нормально, но означает, что «та же версия» не гарантирует тот же
+байт-в-байт образ. Для строгой воспроизводимости фиксируйте digest
+и обновляйте его осознанно.
+\end{warnbox}
+
+\section{Лимиты и кэширование}
+
+Docker Hub ограничивает число скачиваний с одного IP для анонимных
+пользователей и отдельно~--- для авторизованных. Лимиты меняются,
+поэтому проверяйте актуальные условия. Практические меры:
+
+\begin{itemize}
+  \item авторизуйтесь в CI (\cmd{docker login})~--- лимит выше;
+  \item используйте pull-through cache или зеркало реестра;
+  \item в облаках включайте кэширование образов на узлах;
+  \item не скачивайте образ на каждом шаге конвейера~--- один раз
+        на сборку достаточно.
+\end{itemize}
+
+В Compose можно управлять политикой скачивания:
+
+\begin{code}[language=composeyaml]
+services:
+  api:
+    image: ghcr.io/acme/demo-api:1.4.2
+    pull_policy: always
+\end{code}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Реестр хранит образы и слои; имя образа включает домен реестра.
+  \item Публикация требует аутентификации; в CI используйте токены
+        и \flag{--password-stdin}.
+  \item Теги подвижны, digest неизменяем; для production фиксируйте
+        версию или digest.
+  \item Мультиархитектурные образы собираются через
+        \cmd{docker buildx} и публикуются флагом \flag{--push}.
+  \item Доверие к образу обеспечивают сканирование, SBOM, provenance
+        и подписи.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Зачем в имени образа указывать домен реестра?
+  \item Почему \cmd{latest} не подходит для production?
+  \item Чем тег отличается от digest?
+  \item Почему мультиплатформенный образ нельзя загрузить флагом
+        \flag{--load}?
+  \item Какие меры снижают риск запуска скомпрометированного образа?
+  \item Как передать токен в \cmd{docker login} без пароля в аргументах?
+\end{selfcheck}

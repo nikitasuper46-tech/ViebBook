@@ -1,0 +1,330 @@
+\chapter{Контейнеры: жизненный цикл}
+
+Контейнер живёт ровно столько, сколько живёт его главный процесс.
+В этом простом правиле~--- ключ к пониманию большинства \enquote{странностей}
+Docker: почему контейнер сразу завершается, почему не работают логи,
+почему \cmd{docker exec} не спасает от неправильного \cmd{CMD}.
+В главе разобраны состояния контейнера, команды управления, сигналы,
+коды выхода и типичные сценарии отладки.
+
+\section{Главный процесс}
+
+При создании контейнера Docker запускает одну команду~--- она получает
+PID~1 внутри контейнера. Всё остальное~--- это процессы, которые она
+породила. Когда главный процесс завершается, контейнер останавливается,
+даже если внутри остались дочерние процессы.
+
+\begin{defbox}[title={Определение: контейнер (практическое)}]
+Контейнер~--- это исполняемый экземпляр образа. Он состоит из
+записываемого слоя файловой системы, конфигурации (сеть, тома,
+переменные окружения) и главного процесса. Контейнер существует,
+пока существует его главный процесс, либо пока его не удалили.
+\end{defbox}
+
+Отсюда классическая ошибка новичка: запустить \cmd{nginx} в фоне,
+не удержав его на переднем плане. Контейнер тут же завершится.
+Правильный запуск выглядит как \cmd{nginx -g "daemon off;"}~---
+именно это и делает официальный образ \cmd{nginx}.
+
+\begin{warnbox}
+Не используйте внутри контейнера \cmd{systemd}, \cmd{cron} и другие
+менеджеры служб как главный процесс. Docker сам является менеджером
+служб: один контейнер~--- один процесс (или несколько тесно связанных).
+Нужны две службы~--- запустите два контейнера и свяжите их сетью.
+\end{warnbox}
+
+\section{Создание и запуск}
+
+Команда \cmd{docker run} объединяет два шага: \cmd{docker create}
+(создать контейнер) и \cmd{docker start} (запустить его). Разделять
+их полезно, когда контейнер нужно подготовить заранее.
+
+\begin{code}[language=bash]
+$ docker create --name web -p 8080:80 nginx:1.27-alpine
+$ docker start web
+$ docker ps
+CONTAINER ID   IMAGE               COMMAND                  CREATED         STATUS         PORTS                  NAMES
+7c9e1a2b3d4f   nginx:1.27-alpine   "/docker-entrypoint.…"   5 seconds ago   Up 3 seconds   0.0.0.0:8080->80/tcp   web
+\end{code}
+
+Основные флаги \cmd{docker run} собраны в таблице.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Флаг} & \textbf{Назначение} \\
+\midrule
+\flag{--name ИМЯ} & задать имя вместо случайного \\
+\flag{-d} & отсоединиться, работать в фоне \\
+\flag{-i} & оставить stdin открытым \\
+\flag{-t} & выделить псевдотерминал \\
+\flag{--rm} & удалить контейнер после завершения \\
+\flag{-p ХОСТ:КОНТ} & опубликовать порт \\
+\flag{-e ПЕРЕМ=ЗНАЧ} & задать переменную окружения \\
+\flag{--env-file ФАЙЛ} & прочитать переменные из файла \\
+\flag{-v ИСТОЧНИК:ЦЕЛЬ} & подключить том или каталог \\
+\flag{--network СЕТЬ} & подключить к сети \\
+\flag{--restart ПОЛИТИКА} & политика перезапуска \\
+\flag{--memory}, \flag{--cpus} & ограничения ресурсов \\
+\flag{--user UID:GID} & запустить от указанного пользователя \\
+\flag{--entrypoint КОМАНДА} & заменить \cmd{ENTRYPOINT} образа \\
+\flag{--init} & добавить init-процесс для сигналов и зомби \\
+\flag{--platform linux/arm64} & выбрать платформу образа \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{code}[language=bash]
+$ docker run -d --name api \
+    -p 127.0.0.1:3000:3000 \
+    -e NODE_ENV=production \
+    --env-file ./config/api.env \
+    --memory=512m --cpus=1 \
+    --restart unless-stopped \
+    registry.example.com/team/api:1.4.2
+\end{code}
+
+\begin{tipbox}
+Публикуйте порты на конкретном адресе (\flag{-p 127.0.0.1:3000:3000}),
+если сервис не должен быть доступен из сети. Запись
+\flag{-p 3000:3000} открывает порт на всех интерфейсах, включая
+внешний,~--- это частая причина незапланированной публикации.
+\end{tipbox}
+
+\section{Состояния контейнера}
+
+У контейнера несколько состояний, и переходы между ними выполняются
+разными командами.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  font=\sffamily\scriptsize,
+  state/.style={draw=accent!55!black, fill=accent!7, rounded corners=6pt,
+    minimum width=2.6cm, minimum height=0.8cm},
+  trans/.style={-Latex, thick, accent!65},
+]
+  \node[state, fill=good!10, draw=good!60!black] (running) at (4.2,2.6) {running};
+  \node[state] (created) at (1.0,2.6) {created};
+  \node[state, fill=warm!10, draw=warm!65!black] (paused) at (7.4,2.6) {paused};
+  \node[state, fill=black!5, draw=black!40] (exited) at (4.2,0.7) {exited};
+  \node[state, dashed] (removed) at (1.0,0.7) {removed};
+
+  \draw[trans] (created) -- node[above, text=muted] {start, run} (running);
+  \draw[trans] (running) -- node[above, text=muted] {pause} (paused);
+  \draw[trans] (paused) -- node[below, text=muted] {unpause} (running);
+  \draw[trans] ([xshift=-4pt]running.south) --
+    node[left, text=muted] {stop, kill} ([xshift=-4pt]exited.north);
+  \draw[trans] ([xshift=4pt]exited.north) --
+    node[right, text=muted] {start} ([xshift=4pt]running.south);
+  \draw[trans] (exited) -- node[above, text=muted] {rm} (removed);
+  \draw[trans] (created) -- node[right, text=muted] {rm} (removed);
+\end{tikzpicture}
+\caption{Жизненный цикл контейнера. Политика перезапуска автоматически
+переводит контейнер из \cmd{exited} обратно в \cmd{running}}
+\label{fig:lifecycle}
+\end{figure}
+
+\begin{itemize}
+  \item \cmd{created}~--- контейнер создан, но процесс не запущен;
+  \item \cmd{running}~--- главный процесс работает;
+  \item \cmd{paused}~--- процессы заморожены (cgroup freezer), память
+        сохраняется; используется редко, для отладки и миграций;
+  \item \cmd{exited}~--- процесс завершился; файловая система и логи
+        сохраняются до удаления;
+  \item \cmd{removed}~--- контейнер удалён; записываемый слой уничтожен.
+\end{itemize}
+
+Посмотреть состояние можно в \cmd{docker ps -a} или в JSON:
+
+\begin{code}[language=bash]
+$ docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}}' web
+running exit=0
+\end{code}
+
+\section{Остановка, сигналы и коды выхода}
+
+Когда вы выполняете \cmd{docker stop web}, Docker посылает главному
+процессу \cmd{SIGTERM}, ждёт 10~секунд и, если процесс не завершился,
+посылает \cmd{SIGKILL}. Приложение должно корректно обрабатывать
+\cmd{SIGTERM}: закрывать соединения, дописывать файлы, освобождать
+блокировки.
+
+\begin{code}[language=bash]
+$ docker stop web                 # SIGTERM, затем SIGKILL через 10 с
+$ docker stop -t 30 web           # ждать 30 секунд
+$ docker kill web                 # сразу SIGKILL
+$ docker kill -s SIGHUP web       # послать конкретный сигнал
+\end{code}
+
+Коды выхода помогают понять причину остановки.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Код} & \textbf{Значение} \\
+\midrule
+\cmd{0} & успешное завершение \\
+\cmd{1} & ошибка приложения (смотрите логи) \\
+\cmd{126} & файл найден, но не исполняется (нет прав или неверный формат) \\
+\cmd{127} & команда не найдена (опечатка в \cmd{CMD} или нет оболочки) \\
+\cmd{137} & процесс убит \cmd{SIGKILL} (128+9), часто из-за лимита памяти \\
+\cmd{143} & процесс завершён \cmd{SIGTERM} (128+15) \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{warnbox}
+Код \cmd{137}~--- не всегда ошибка приложения. Если контейнер убит
+из-за \cmd{OOMKilled}, увеличьте лимит памяти или исправьте утечку.
+Проверить причину: \cmd{docker inspect --format '\{\{.State.OOMKilled\}\}' web}
+и \cmd{docker inspect --format '\{\{.State.ExitCode\}\}' web}.
+\end{warnbox}
+
+\section{Логи и стандартные потоки}
+
+Docker перехватывает stdout и stderr главного процесса и сохраняет их
+через драйвер журналирования (по умолчанию \cmd{json-file}).
+Файлы, которые приложение пишет само, в логи Docker не попадают~---
+их нужно читать через \cmd{docker exec} или выносить в том.
+
+\begin{code}[language=bash]
+$ docker logs web
+$ docker logs -f web              # следить в реальном времени
+$ docker logs --tail 100 web
+$ docker logs --since 10m web
+$ docker logs -t web              # с метками времени
+$ docker logs web > web.log 2>&1  # сохранить в файл
+\end{code}
+
+\begin{tipbox}
+Правило двенадцати факторов: приложение должно писать логи в stdout
+и stderr, а не в файлы. Тогда \cmd{docker logs}, системы сбора логов
+и платформы оркестрации работают без дополнительной настройки.
+\end{tipbox}
+
+\begin{warnbox}
+Без ограничения размера журналы могут занять весь диск: \cmd{json-file}
+растёт неограниченно. Настройте \cmd{log-opts} в \file{daemon.json}
+(раздел~3.9) или задайте \flag{--log-opt max-size=10m} для контейнера.
+\end{warnbox}
+
+\section{Работа с работающим контейнером}
+
+\cmd{docker exec} запускает дополнительный процесс внутри уже
+работающего контейнера. Это главный инструмент отладки.
+
+\begin{code}[language=bash]
+$ docker exec -it web sh
+$ docker exec web env
+$ docker exec -u root web whoami
+$ docker exec -w /usr/share/nginx/html web ls -la
+\end{code}
+
+Не путайте \cmd{exec} и \cmd{attach}:
+
+\begin{itemize}
+  \item \cmd{docker exec} создаёт \emph{новый} процесс. Оболочка
+        не влияет на главный процесс и безопасно закрывается по \cmd{exit}.
+  \item \cmd{docker attach} подключается к stdio главного процесса.
+        Выход по \cmd{Ctrl+C} может отправить сигнал и остановить
+        контейнер; отключиться без остановки~--- \cmd{Ctrl+P}, затем
+        \cmd{Ctrl+Q}.
+\end{itemize}
+
+Другие полезные команды:
+
+\begin{code}[language=bash]
+$ docker cp web:/etc/nginx/nginx.conf ./nginx.conf
+$ docker diff web                  # изменённые файлы в записываемом слое
+$ docker top web                   # процессы контейнера
+$ docker port web                  # опубликованные порты
+$ docker stats --no-stream web     # потребление ресурсов
+$ docker rename web web-old
+\end{code}
+
+\begin{notebox}
+В минимальных образах (alpine, distroless, scratch) может не быть
+\cmd{sh}, \cmd{bash}, \cmd{curl} и даже \cmd{ls}. Это нормально и полезно
+для безопасности, но усложняет отладку. Используйте отладочный вариант
+образа, временный контейнер с теми же томами и сетью или \cmd{docker debug}
+(если он доступен в вашей подписке).
+\end{notebox}
+
+\section{Политики перезапуска}
+
+Политика перезапуска определяет, что делать, когда главный процесс
+завершился.
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Политика} & \textbf{Поведение} \\
+\midrule
+\cmd{no} & не перезапускать (по умолчанию) \\
+\cmd{on-failure[:N]} & перезапускать при ненулевом коде выхода,
+не более \cmd{N} раз \\
+\cmd{always} & перезапускать всегда, в том числе после перезапуска демона \\
+\cmd{unless-stopped} & как \cmd{always}, но не поднимать контейнер,
+остановленный вручную \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{code}[language=bash]
+$ docker run -d --restart unless-stopped --name api api:1.4.2
+$ docker update --restart on-failure:3 api
+$ docker update --memory 1g --cpus 2 api
+\end{code}
+
+\begin{warnbox}
+Политика \cmd{always} и ошибочный \cmd{CMD} дают бесконечный цикл
+перезапусков, который маскирует проблему и нагружает диск логами.
+Сначала добейтесь, чтобы контейнер работал без перезапусков, и только
+потом включайте политику.
+\end{warnbox}
+
+\section{Разбор типичной ситуации}
+
+Контейнер с приложением сразу завершается. Что делать:
+
+\begin{enumerate}
+  \item \cmd{docker ps -a}~--- посмотреть код выхода и статус.
+  \item \cmd{docker logs <имя>}~--- прочитать последние строки.
+  \item \cmd{docker inspect <имя>}~--- проверить \cmd{Cmd}, \cmd{Entrypoint},
+        \cmd{Env}, монтирования.
+  \item Запустить с другой командой, чтобы получить оболочку:
+        \cmd{docker run --rm -it --entrypoint sh IMAGE}.
+  \item Проверить, не завершается ли главный процесс из-за отсутствия
+        терминала или из-за того, что демон ушёл в фон.
+\end{enumerate}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Контейнер живёт, пока живёт его главный процесс с PID~1.
+  \item \cmd{run} = \cmd{create} + \cmd{start}; состояния
+        \cmd{created}, \cmd{running}, \cmd{paused}, \cmd{exited},
+        \cmd{removed}.
+  \item \cmd{stop} посылает \cmd{SIGTERM}, затем \cmd{SIGKILL};
+        код 137 часто означает нехватку памяти.
+  \item Логи~--- это stdout и stderr; \cmd{exec} запускает новый процесс,
+        \cmd{attach} подключается к главному.
+  \item Политики перезапуска помогают в production, но маскируют
+        ошибки при отладке.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Почему контейнер с nginx без \cmd{daemon off} сразу завершается?
+  \item Чем \cmd{docker stop} отличается от \cmd{docker kill}?
+  \item Что означает код выхода 137 и как проверить, не убит ли контейнер
+        из-за нехватки памяти?
+  \item Чем \cmd{exec} отличается от \cmd{attach}?
+  \item Зачем нужна политика \cmd{unless-stopped}?
+  \item Где окажутся логи, если приложение пишет их в
+        \file{/var/log/app.log}?
+\end{selfcheck}

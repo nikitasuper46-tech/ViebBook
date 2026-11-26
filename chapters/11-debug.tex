@@ -1,0 +1,286 @@
+\chapter{Диагностика и отладка}
+
+Большинство проблем с Docker решается тремя вопросами: что говорит
+сам контейнер, что он видит изнутри и что происходит на хосте.
+В главе собраны команды и приёмы, которые позволяют быстро пройти
+этот путь: от \cmd{docker ps} до \cmd{nsenter} и анализа OOM.
+
+\section{С чего начать}
+
+\begin{enumerate}
+  \item \cmd{docker ps -a}~--- какие контейнеры есть, в каком они
+        состоянии и с каким кодом выхода.
+  \item \cmd{docker logs <контейнер>}~--- что писало приложение.
+  \item \cmd{docker inspect <контейнер>}~--- как он сконфигурирован:
+        команда, переменные, монтирования, сеть, лимиты.
+  \item Проверка изнутри: \cmd{docker exec} или временный отладочный
+        контейнер.
+  \item Проверка хоста: диск, память, порты, журнал демона.
+\end{enumerate}
+
+\section{Инспекция контейнера}
+
+Команда \cmd{docker inspect} возвращает большой JSON. Полезно сразу
+извлекать нужные поля через \flag{--format}.
+
+\begin{code}[language=bash]
+$ docker inspect --format '{{.State.Status}}' web
+running
+$ docker inspect --format '{{.State.ExitCode}} {{.State.OOMKilled}}' web
+137 true
+$ docker inspect --format '{{json .Config.Env}}' web
+["PATH=/usr/local/sbin:...","NGINX_VERSION=1.27.3"]
+$ docker inspect --format '{{json .Mounts}}' web
+$ docker inspect --format '{{json .NetworkSettings.Networks}}' web
+$ docker inspect --format '{{.HostConfig.Memory}}' web
+536870912
+$ docker inspect --format '{{json .Config.Labels}}' web
+\end{code}
+
+\begin{tipbox}
+Сохраните полезные шаблоны в алиасы:
+\cmd{docker inspect -f '\{\{.State.Status\}\} \{\{.State.ExitCode\}\}'}.
+Это быстрее, чем читать весь JSON глазами.
+\end{tipbox}
+
+\section{Логи и события}
+
+\begin{code}[language=bash]
+$ docker logs --tail 200 web
+$ docker logs --since 15m --until 5m web
+$ docker logs -t web
+$ docker events --since 30m
+$ docker events --filter type=container --filter event=die
+\end{code}
+
+Если контейнер не пишет в stdout, логи придётся искать иначе: внутри
+контейнера (\cmd{docker exec}) или в привязанном каталоге на хосте.
+
+\begin{code}[language=bash]
+$ docker exec web tail -n 50 /var/log/nginx/error.log
+$ sudo journalctl -u docker --since "1 hour ago"
+\end{code}
+
+\begin{notebox}
+Журнал демона (\cmd{journalctl -u docker}) показывает проблемы самого
+Docker: ошибки драйвера хранения, сети, запуска контейнеров. Журнал
+контейнера (\cmd{docker logs})~--- проблемы приложения. Не путайте их.
+\end{notebox}
+
+\section{Ресурсы}
+
+\begin{code}[language=bash]
+$ docker stats --no-stream
+$ docker stats web db
+$ docker top web
+$ docker system df
+$ docker system df -v
+\end{code}
+
+\begin{code}[language=bash]
+$ docker stats --no-stream \
+    --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}'
+NAME   CPU %   MEM USAGE / LIMIT
+web    0.12%   3.4MiB / 512MiB
+db     0.40%   42MiB / 1GiB
+\end{code}
+
+Если \cmd{docker stats} показывает потребление близко к лимиту,
+а приложение падает с кодом 137, вероятна нехватка памяти. Проверьте
+флаг \cmd{OOMKilled} и журнал ядра:
+
+\begin{code}[language=bash]
+$ docker inspect -f '{{.State.OOMKilled}}' web
+true
+$ sudo journalctl -k | grep -i -E 'oom|killed process' | tail
+\end{code}
+
+\section{Отладка изнутри}
+
+\begin{code}[language=bash]
+$ docker exec -it web sh
+$ docker exec -u root web sh
+$ docker exec -w /app web ls -la
+$ docker exec web env | sort
+$ docker exec web ps aux
+$ docker exec web cat /etc/os-release
+\end{code}
+
+Если в образе нет оболочки и утилит (distroless, scratch), есть
+несколько путей.
+
+\subsection{Отладочный контейнер в тех же сетях и томах}
+
+\begin{code}[language=bash]
+$ docker run --rm -it \
+    --network container:web \
+    --pid container:web \
+    nicolaka/netshoot
+\end{code}
+
+Флаг \flag{--network container:web} подключает отладочный контейнер
+к сетевому пространству имён \cmd{web}, а \flag{--pid container:web}
+позволяет видеть его процессы.
+
+\subsection{docker debug}
+
+В Docker Desktop и некоторых подписках доступна команда
+\cmd{docker debug}, которая подключает к контейнеру набор отладочных
+инструментов, не меняя образ.
+
+\begin{code}[language=bash]
+$ docker debug web
+\end{code}
+
+\subsection{Пространства имён хоста}
+
+Крайняя мера~--- зайти в пространства имён контейнера с хоста.
+Требует root и используется осторожно.
+
+\begin{code}[language=bash]
+$ PID=$(docker inspect -f '{{.State.Pid}}' web)
+$ sudo nsenter -t "$PID" -m -u -n -i sh
+\end{code}
+
+\begin{warnbox}
+Команды с \flag{--privileged}, \flag{--pid=host} и \cmd{nsenter}
+дают почти полный доступ к хосту. Используйте их только на своей
+машине и никогда~--- в автоматических скриптах на общих серверах.
+\end{warnbox}
+
+\section{Типичные проблемы}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lXX@{}}
+\toprule
+\textbf{Симптом} & \textbf{Причина} & \textbf{Что делать} \\
+\midrule
+exit 127 & команда не найдена & проверить \cmd{CMD}/\cmd{ENTRYPOINT},
+\cmd{PATH}, наличие оболочки \\
+exit 126 & нет прав на исполнение & \cmd{chmod +x}, проверить
+архитектуру и shebang \\
+exit 137 & \cmd{SIGKILL}, часто OOM & увеличить \cmd{--memory},
+искать утечку, смотреть \cmd{OOMKilled} \\
+exit 143 & \cmd{SIGTERM} & нормальная остановка; проверить,
+кто послал сигнал \\
+контейнер сразу завершается & главный процесс ушёл в фон & запускать
+на переднем плане, проверить логи \\
+\cmd{port is already allocated} & порт занят & \cmd{ss -ltnp},
+сменить порт \\
+\cmd{permission denied} на томе & несовпадение UID/GID & выровнять
+владельца, \cmd{chown} в init-контейнере \\
+\cmd{no space left on device} & диск заполнен & \cmd{docker system df},
+prune, перенести \cmd{data-root} \\
+имя не разрешается & разные сети или default bridge & общая
+пользовательская сеть \\
+\cmd{exec format error} & неверная архитектура & мультиарх-образ
+или \flag{--platform} \\
+\cmd{connection refused} & сервис слушает \cmd{127.0.0.1} & слушать
+\cmd{0.0.0.0} \\
+\cmd{TLS handshake timeout} & проблемы с реестром или прокси & проверить
+DNS, прокси, сертификаты \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Контейнер перезапускается по кругу}
+
+\begin{code}[language=bash]
+$ docker ps -a --filter name=api
+$ docker inspect -f '{{.RestartCount}}' api
+$ docker logs --tail 50 api
+\end{code}
+
+Политика \cmd{always} или \cmd{unless-stopped} маскирует падение:
+контейнер поднимается снова и снова. Временно отключите перезапуск
+(\cmd{docker update --restart no api}), добейтесь успешного запуска
+вручную и только потом возвращайте политику.
+
+\subsection{Диск заполнен}
+
+\begin{code}[language=bash]
+$ df -h /var/lib/docker
+$ sudo du -sh /var/lib/docker/* | sort -h | tail
+$ docker system df -v
+$ docker builder prune
+$ docker image prune
+$ docker container prune
+\end{code}
+
+\begin{warnbox}
+\cmd{docker system prune -a --volumes} удаляет все неиспользуемые
+образы, контейнеры, сети и тома. Это необратимая операция. Сначала
+посмотрите \cmd{docker system df -v} и убедитесь, что среди томов
+нет баз и резервных копий.
+\end{warnbox}
+
+\section{Наблюдаемость}
+
+Для production недостаточно \cmd{docker stats}. Используйте:
+
+\begin{itemize}
+  \item \textbf{healthcheck}~--- базовый сигнал живости сервиса;
+  \item \textbf{cAdvisor}~--- метрики контейнеров в формате Prometheus;
+  \item \textbf{node\_exporter}~--- метрики хоста;
+  \item \textbf{централизованные логи}~--- Loki, Elasticsearch,
+        облачные сервисы;
+  \item \textbf{трейсинг}~--- OpenTelemetry для распределённых
+        запросов.
+\end{itemize}
+
+\begin{code}[language=composeyaml]
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+\end{code}
+
+\begin{notebox}
+\cmd{cadvisor} требует доступа к каталогам хоста и обычно запускается
+с правами, близкими к root. На shared-хостах это нужно согласовывать
+с политикой безопасности.
+\end{notebox}
+
+\section{Чек-лист отладки}
+
+\begin{enumerate}
+  \item Контейнер существует и в каком состоянии?
+  \item Какой код выхода и не было ли OOM?
+  \item Что в логах приложения и демона?
+  \item Совпадает ли команда запуска с ожидаемой?
+  \item Видит ли контейнер нужные переменные, файлы и тома?
+  \item В той ли сети он находится и доступен ли сосед по имени?
+  \item Хватает ли ресурсов: память, CPU, диск?
+  \item Не мешает ли firewall, прокси или SELinux?
+\end{enumerate}
+
+\begin{summarybox}
+\begin{itemize}
+  \item Начинайте с \cmd{ps}, \cmd{logs} и \cmd{inspect}.
+  \item \cmd{stats}, \cmd{top} и \cmd{system df} показывают ресурсы;
+        код 137 и \cmd{OOMKilled} указывают на память.
+  \item Для отладки минимальных образов используйте netshoot,
+        \cmd{docker debug} или \cmd{nsenter}.
+  \item Политика перезапуска маскирует падения: отключайте её на время
+        диагностики.
+  \item В production нужны healthcheck, метрики и централизованные
+        логи, а не только \cmd{docker stats}.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Какие три команды дают первичную картину состояния контейнера?
+  \item Как узнать, был ли контейнер убит из-за нехватки памяти?
+  \item Чем журнал демона отличается от журнала контейнера?
+  \item Как отладить контейнер из distroless-образа без оболочки?
+  \item Что проверять, если контейнер перезапускается по кругу?
+  \item Почему \cmd{docker system prune -a --volumes} опасен?
+\end{selfcheck}

@@ -1,0 +1,62 @@
+\begin{titlepage}
+\thispagestyle{empty}
+\begin{tikzpicture}[remember picture, overlay]
+  % Верхняя цветная полоса
+  \fill[accent] (current page.north west) rectangle ([yshift=-10.6cm]current page.north east);
+
+  % Декоративные «контейнеры»
+  \begin{scope}[shift={([xshift=-6.3cm,yshift=-3.1cm]current page.north east)}]
+    \foreach \dx/\dy/\op in {0/0/0.20, 1.15/0.55/0.14, 2.3/1.1/0.08}{
+      \draw[white, opacity=\op, fill=white, fill opacity=0.035, line width=0.7pt, rounded corners=1.5pt]
+        (\dx,\dy) rectangle ++(1.9,1.55);
+      \draw[white, opacity=\op, line width=0.7pt]
+        (\dx+0.35,\dy+1.55) -- (\dx+0.35,\dy+0.55) -- (\dx+1.9,\dy+0.55);
+    }
+  \end{scope}
+
+  \node[anchor=north west, text width=12cm, align=left, font=\sffamily]
+    at ([xshift=2.7cm,yshift=-2.7cm]current page.north west) {%
+      {\color{white!80!accent}\bfseries\small\MakeUppercase{Учебное пособие}}\\[0.75cm]
+      {\color{white}\bfseries\fontsize{52}{56}\selectfont ОСНОВЫ\\[3pt]DOCKER}\\[0.65cm]
+      {\color{white!90!accent}\Large Контейнеры, образы,\\ сети и Docker Compose}
+  };
+\end{tikzpicture}
+
+\vspace*{11.4cm}
+
+\begin{center}
+\begin{tikzpicture}[font=\sffamily\footnotesize, x=1cm, y=1cm]
+  \draw[fill=white, draw=warm, dashed, rounded corners=2pt, line width=0.8pt]
+    (0,2.85) rectangle (12.5,3.7);
+  \node[anchor=west, text=warm] at (0.3,3.275) {записываемый слой контейнера};
+
+  \draw[fill=accent!16, draw=accent!55!black, rounded corners=2pt]
+    (0,1.9) rectangle (12.5,2.75);
+  \node[anchor=west, text=accent!80!black] at (0.3,2.325)
+    {слой~3: \texttt{COPY . .} --- код приложения};
+
+  \draw[fill=accent!10, draw=accent!55!black, rounded corners=2pt]
+    (0,0.95) rectangle (12.5,1.8);
+  \node[anchor=west, text=accent!80!black] at (0.3,1.375)
+    {слой~2: \texttt{RUN npm install} --- зависимости};
+
+  \draw[fill=accent!6, draw=accent!55!black, rounded corners=2pt]
+    (0,0) rectangle (12.5,0.85);
+  \node[anchor=west, text=accent!80!black] at (0.3,0.425)
+    {слой~1: \texttt{FROM node:22-alpine} --- базовый образ};
+
+  \node[anchor=north, text=muted, align=center] at (6.25,-0.25)
+    {Образ~--- неизменяемый стек слоёв. Контейнер добавляет сверху\\один записываемый слой, который исчезает вместе с контейнером.};
+\end{tikzpicture}
+\end{center}
+
+\vfill
+
+\begin{center}
+  {\sffamily\small\color{muted}
+   Четыре части \textbullet{} 13~глав\\
+   Схемы, листинги и вопросы для самопроверки}\\[0.5cm]
+  {\sffamily\bfseries\large\color{accent} 2026}
+\end{center}
+
+\end{titlepage}

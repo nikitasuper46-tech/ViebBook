@@ -1,0 +1,292 @@
+\chapter{Образы}
+
+Образ~--- фундамент всего в Docker. Контейнеры создаются из образов,
+реестры хранят образы, Dockerfile описывает, как образ собрать.
+В этой главе разобрано, из чего состоит образ, как устроены имена и теги,
+почему слои важны для скорости и как безопасно работать с локальным
+хранилищем.
+
+\section{Из чего состоит образ}
+
+Образ~--- это не один файл, а набор взаимосвязанных объектов:
+
+\begin{itemize}
+  \item \textbf{манифест} (\emph{manifest})~--- JSON-документ со списком слоёв,
+        их контрольными суммами и ссылкой на конфигурацию;
+  \item \textbf{конфигурация}~--- JSON с метаданными: команда запуска,
+        переменные окружения, рабочий каталог, пользователь, порты;
+  \item \textbf{слои}~--- tar-архивы с изменениями файловой системы.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[font=\sffamily\scriptsize, x=1cm, y=1cm]
+  \draw[fill=warm!8, draw=warm, dashed, rounded corners=2pt]
+    (0,4.25) rectangle (9.2,5.1);
+  \node[anchor=west, text=warm] at (0.3,4.675)
+    {записываемый слой контейнера: изменения исчезают при \cmd{docker rm}};
+
+  \draw[fill=accent!16, draw=accent!55!black, rounded corners=2pt]
+    (0,3.15) rectangle (9.2,4.0);
+  \node[anchor=west, text=accent!85!black] at (0.3,3.575)
+    {слой 3: \cmd{COPY . .}~--- код приложения};
+  \node[anchor=east, text=muted] at (8.9,3.575) {1,2 МБ};
+
+  \draw[fill=accent!11, draw=accent!55!black, rounded corners=2pt]
+    (0,2.05) rectangle (9.2,2.9);
+  \node[anchor=west, text=accent!85!black] at (0.3,2.475)
+    {слой 2: \cmd{RUN npm ci}~--- зависимости};
+  \node[anchor=east, text=muted] at (8.9,2.475) {85 МБ};
+
+  \draw[fill=accent!7, draw=accent!55!black, rounded corners=2pt]
+    (0,0.95) rectangle (9.2,1.8);
+  \node[anchor=west, text=accent!85!black] at (0.3,1.375)
+    {слой 1: \cmd{FROM node:22-alpine}~--- базовый образ};
+  \node[anchor=east, text=muted] at (8.9,1.375) {130 МБ};
+
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}, draw=accent!60]
+    (9.45,0.9) -- (9.45,4.05)
+    node[midway, right=6pt, align=left, text=accent!80!black]
+      {слои образа\\только для чтения};
+
+  \node[anchor=north west, text=muted, align=left] at (0,-0.15)
+    {Манифест перечисляет слои и их digest; конфигурация хранит
+     \cmd{CMD}, \cmd{ENV}, \cmd{EXPOSE} и другие метаданные.};
+\end{tikzpicture}
+\caption{Образ~--- стек неизменяемых слоёв и метаданные; контейнер получает
+сверху собственный записываемый слой}\label{fig:layers}
+\end{figure}
+
+Слои адресуются по содержимому: \cmd{sha256:...} вычисляется от архива.
+Если два образа содержат одинаковый слой, он хранится один раз
+и скачивается один раз. Поэтому \cmd{docker pull} второго образа
+на той же базе обычно занимает секунды.
+
+\begin{notebox}
+Исторически образы Docker состояли из слоёв с файлом \file{layer.json}
+и родительскими ссылками. Современные образы следуют спецификации OCI
+Image Format: манифест, конфигурация и слои~--- отдельные объекты
+в хранилище. Docker, Podman и Kubernetes читают этот формат одинаково.
+\end{notebox}
+
+\section{Имена, теги и digest}
+
+Полное имя образа выглядит так:
+
+\begin{center}
+\cmd{[registry/][namespace/]repository[:tag][@digest]}
+\end{center}
+
+\begin{itemize}
+  \item \cmd{registry}~--- адрес реестра. Если не указан, используется
+        \cmd{docker.io} (Docker Hub);
+  \item \cmd{namespace}~--- владелец или организация. Официальные образы
+        живут в пространстве \cmd{library}, поэтому \cmd{nginx}~--- это
+        сокращение от \cmd{docker.io/library/nginx};
+  \item \cmd{repository}~--- имя образа;
+  \item \cmd{tag}~--- человекочитаемая метка версии, по умолчанию
+        \cmd{latest};
+  \item \cmd{@digest}~--- криптографический хеш манифеста, неизменяемая
+        ссылка на конкретную сборку.
+\end{itemize}
+
+\begin{code}[language=bash]
+$ docker pull nginx
+Using default tag: latest
+...
+$ docker pull nginx:1.27-alpine
+$ docker pull nginx@sha256:0f2ab24c6aba...
+\end{code}
+
+\begin{warnbox}
+\cmd{latest}~--- просто тег по умолчанию, а не \enquote{самая свежая версия}.
+Владелец образа может перезаписать его в любой момент. Сборка, которая
+год назад использовала \cmd{nginx:latest}, сегодня может получить совсем
+другой код. Для воспроизводимости фиксируйте версию (\cmd{nginx:1.27-alpine})
+или digest.
+\end{warnbox}
+
+Тег~--- это удобная, но подвижная ссылка. Digest~--- точная. Хорошая
+практика: в разработке использовать тег, в production~--- тег плюс digest
+или неизменяемые теги вида \cmd{1.27.3-alpine}.
+
+\begin{tipbox}
+Узнать digest уже скачанного образа:
+\cmd{docker image inspect --format '\{\{index .RepoDigests 0\}\}' nginx:1.27-alpine}.
+Так можно зафиксировать образ в манифесте поставки, не выискивая хеш
+на сайте реестра.
+\end{tipbox}
+
+\section{Слои на практике}
+
+Посмотрим на реальный образ.
+
+\begin{code}[language=bash]
+$ docker pull nginx:1.27-alpine
+$ docker image ls nginx
+REPOSITORY   TAG           IMAGE ID       CREATED       SIZE
+nginx        1.27-alpine   a8b1c3d4e5f6   2 weeks ago   48.2MB
+$ docker history nginx:1.27-alpine
+IMAGE          CREATED       CREATED BY                                      SIZE
+a8b1c3d4e5f6   2 weeks ago   CMD ["nginx" "-g" "daemon off;"]                0B
+<missing>      2 weeks ago   STOPSIGNAL SIGQUIT                              0B
+<missing>      2 weeks ago   EXPOSE map[80/tcp:{}]                           0B
+...
+<missing>      2 weeks ago   /bin/sh -c #(nop) ADD file:... in /             7.8MB
+\end{code}
+
+Обратите внимание: инструкции, которые меняют только метаданные
+(\cmd{CMD}, \cmd{EXPOSE}, \cmd{STOPSIGNAL}), имеют размер \cmd{0B}
+и не создают новых слоёв. Слои появляются там, где меняется файловая
+система: \cmd{RUN}, \cmd{COPY}, \cmd{ADD}.
+
+Команда \cmd{docker history} показывает и \cmd{<missing>}~--- это
+нормально: промежуточные образы старых сборок не хранятся, но их слои
+остаются частью итогового образа.
+
+\section{Основные команды работы с образами}
+
+\begin{center}
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Команда} & \textbf{Назначение} \\
+\midrule
+\cmd{docker pull IMAGE} & скачать образ из реестра \\
+\cmd{docker images} & список локальных образов (алиас \cmd{docker image ls}) \\
+\cmd{docker image inspect IMAGE} & метаданные в JSON \\
+\cmd{docker history IMAGE} & слои и создавшие их инструкции \\
+\cmd{docker tag SRC DST} & добавить ещё одно имя (тег) к образу \\
+\cmd{docker rmi IMAGE} & удалить образ \\
+\cmd{docker image prune} & удалить \enquote{висячие} образы \\
+\cmd{docker save -o file.tar IMAGE} & сохранить образ в архив \\
+\cmd{docker load -i file.tar} & загрузить образ из архива \\
+\cmd{docker export CONTAINER} & экспортировать файловую систему контейнера \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{code}[language=bash]
+$ docker image inspect nginx:1.27-alpine \
+    --format '{{.Config.Cmd}}'
+[/docker-entrypoint.sh nginx -g daemon off;]
+$ docker image inspect nginx:1.27-alpine \
+    --format '{{json .Config.Env}}'
+["PATH=/usr/local/sbin:...","NGINX_VERSION=1.27.3",...]
+$ docker tag nginx:1.27-alpine registry.example.com/team/nginx:1.27.3
+$ docker rmi nginx:1.27-alpine
+\end{code}
+
+\begin{notebox}
+\cmd{docker rmi} удаляет только имя. Слои освободятся, когда на образ
+не останется ссылок: тегов и контейнеров (в том числе остановленных).
+Если образ используется контейнером, команда откажется его удалять,
+пока вы не удалите контейнер или не добавите \flag{-f}.
+\end{notebox}
+
+\begin{warnbox}
+\cmd{docker image prune -a} удаляет все образы, не используемые
+контейнерами, включая те, что вы скачали для работы завтра.
+Не выполняйте эту команду \enquote{на всякий случай} на рабочей машине:
+повторное скачивание может быть долгим, а локально собранные образы
+исчезнут безвозвратно.
+\end{warnbox}
+
+\section{\cmd{save} и \cmd{export}: не одно и то же}
+
+Две команды легко перепутать.
+
+\begin{itemize}
+  \item \cmd{docker save} сохраняет \emph{образ} целиком: все слои
+        и метаданные. \cmd{docker load} восстанавливает его один в один.
+        Это способ перенести образ в изолированную сеть.
+  \item \cmd{docker export} сохраняет \emph{файловую систему контейнера}
+        одним слоем, без истории и метаданных образа. Результат можно
+        использовать как rootfs, но не как полноценный образ с
+        \cmd{CMD}, \cmd{ENV} и \cmd{ENTRYPOINT}.
+\end{itemize}
+
+\begin{code}[language=bash]
+$ docker save -o nginx.tar nginx:1.27-alpine
+$ docker load -i nginx.tar
+$ docker export web > web-rootfs.tar
+\end{code}
+
+\begin{tipbox}
+Если нужно передать образ между машинами без реестра, используйте
+\cmd{docker save} вместе со сжатием:
+\cmd{docker save nginx:1.27-alpine | gzip > nginx.tar.gz}.
+Обратная операция~--- \cmd{gunzip -c nginx.tar.gz | docker load}.
+\end{tipbox}
+
+\section{Как читать размер образа}
+
+\cmd{docker image ls} показывает размер распакованных слоёв, приписывая
+каждый общий слой первому образу, который его использует. Поэтому сумма
+размеров в списке может не совпадать с занятым диском.
+Реальную картину даёт \cmd{docker system df -v}: он показывает,
+сколько места занимают образы, контейнеры, тома и кэш сборки.
+
+\begin{code}[language=bash]
+$ docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          12        3         2.41GB    1.82GB (75%)
+Containers      5         2         12.3MB    8.1MB (65%)
+Local Volumes   4         2         210MB     96MB (45%)
+Build Cache     34        0         1.1GB     1.1GB
+\end{code}
+
+\begin{notebox}
+Большой образ не обязательно означает медленный запуск: контейнер
+не копирует слои, а использует их через overlayfs. Но большой образ
+дольше скачивать и дольше распаковывать при первом запуске на новой
+машине. Как уменьшать размеры~--- в главе~13.
+\end{notebox}
+
+\section{Образы и архитектуры}
+
+Один тег может указывать на несколько сборок для разных архитектур.
+Например, \cmd{nginx:alpine} для \cmd{amd64} и \cmd{arm64}~--- разные
+манифесты, объединённые списком (manifest list). При скачивании Docker
+автоматически выбирает подходящий вариант.
+
+\begin{code}[language=bash]
+$ docker manifest inspect nginx:1.27-alpine
+{
+   "manifests": [
+      { "platform": { "architecture": "amd64", "os": "linux" }, ... },
+      { "platform": { "architecture": "arm64", "os": "linux" }, ... }
+   ]
+}
+\end{code}
+
+Если образа для вашей архитектуры нет, вы получите предупреждение
+о несовпадении платформы или ошибку \cmd{exec format error}. Решения:
+использовать мультиархитектурный образ, собрать свой (раздел~10.5)
+или включить эмуляцию через QEMU (медленно, только для отладки).
+
+\begin{summarybox}
+\begin{itemize}
+  \item Образ~--- манифест, конфигурация и набор неизменяемых слоёв.
+  \item Имя образа включает реестр, пространство имён, репозиторий, тег
+        и, при необходимости, digest.
+  \item Тег подвижен, digest неизменяем; для воспроизводимости фиксируйте
+        версию.
+  \item Слои разделяются между образами и кэшируются; метаданные новых
+        слоёв не создают.
+  \item \cmd{save} переносит образ, \cmd{export}~--- только файловую
+        систему контейнера.
+\end{itemize}
+\end{summarybox}
+
+\section*{Вопросы для самопроверки}
+\begin{selfcheck}
+  \item Из каких трёх частей состоит образ?
+  \item Почему \cmd{nginx} и \cmd{docker.io/library/nginx:latest}~---
+        одно и то же?
+  \item Чем тег отличается от digest и почему это важно для production?
+  \item Какие инструкции Dockerfile создают слои, а какие~--- нет?
+  \item Чем \cmd{docker save} отличается от \cmd{docker export}?
+  \item Почему сумма размеров в \cmd{docker images} может превышать
+        реально занятое место?
+\end{selfcheck}
